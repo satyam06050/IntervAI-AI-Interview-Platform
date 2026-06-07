@@ -130,7 +130,6 @@ celerybeat.pid
 # Environments
 .env
 .venv
-.env.local
 env/
 venv/
 ENV/
@@ -180,5 +179,3 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
-.md*
- LIVEKIT_ANALYSIS.md
