@@ -144,7 +144,7 @@
                 
                 <!-- Candidate Caption -->
                 <div class="candidate-caption">
-                    <p class="caption-text empty" id="candidateCaption">Speak to begin...</p>
+                    <p class="caption-text empty" id="candidateCaption">Initiating...</p>
                 </div>
             </div>
         </main>
@@ -333,7 +333,13 @@
             startTimer();
             startBlinkAnimation();
             startDemoAnimations();
-            
+
+            // Set initial stage color
+            var progressHeader = document.querySelector('.progress-header');
+            if (progressHeader) {
+                progressHeader.setAttribute('data-current-stage', 'greeting');
+            }
+
             console.log('[INIT] Calling connectToRoom...');
             connectToRoom();
             
@@ -365,6 +371,12 @@
 
                 var oldStage = state.currentStage;
                 state.currentStage = newStage;
+
+                // Update data attribute for stage-specific styling
+                var progressHeader = document.querySelector('.progress-header');
+                if (progressHeader) {
+                    progressHeader.setAttribute('data-current-stage', newStage);
+                }
 
                 elements.stateFlash.classList.add('active');
                 setTimeout(function() { elements.stateFlash.classList.remove('active'); }, 600);
@@ -926,6 +938,7 @@
                     state.room.on(LK.RoomEvent.DataReceived, onDataReceived);
                     state.room.on(LK.RoomEvent.ParticipantConnected, onParticipantConnected);
                     state.room.on(LK.RoomEvent.ActiveSpeakersChanged, onActiveSpeakersChanged);
+                    state.room.on(LK.RoomEvent.LocalTrackPublished, onLocalTrackPublished);
                     
                     console.log('[CONNECT] Connecting to LiveKit server:', data.url);
                     await state.room.connect(data.url, data.token);
@@ -941,26 +954,55 @@
                 console.log('[ROOM] Connected');
                 state.isConnected = true;
                 updateStatus('Connected', 'connected');
-                
+
                 try {
                     await state.room.localParticipant.setMicrophoneEnabled(true);
                     console.log('[ROOM] Microphone enabled');
-                    
+
                     var audioTracks = state.room.localParticipant.getTrackPublications();
+                    var visualizationInitialized = false;
+
                     audioTracks.forEach(function(pub) {
                         if (pub.track && pub.track.kind === 'audio' && pub.track.mediaStream) {
                             initCandidateAudioVisualization(pub.track.mediaStream);
+                            visualizationInitialized = true;
+                            console.log('[AUDIO] Candidate visualization initialized from existing track');
                         }
                     });
-                    
-                    updateCandidateCaption('Microphone active - speak to begin');
-                    
+
+                    if (!visualizationInitialized) {
+                        console.log('[AUDIO] Waiting for LocalTrackPublished event for visualization');
+                    }
+
+                    updateCandidateCaption('Waiting for agent to join...');
+
                 } catch (err) {
                     console.error('[ROOM] Microphone error:', err);
                     updateStatus('Microphone access denied', 'error');
                 }
             }
-            
+
+            function onLocalTrackPublished(publication, participant) {
+                console.log('[TRACK] Local track published:', publication.kind);
+
+                if (publication.kind === LK.Track.Kind.Audio && publication.track) {
+                    console.log('[AUDIO] Initializing candidate visualization with local audio track');
+
+                    // Get the MediaStream from the track
+                    if (publication.track.mediaStream) {
+                        initCandidateAudioVisualization(publication.track.mediaStream);
+                        console.log('[AUDIO] Candidate audio visualization started');
+                    } else if (publication.track.mediaStreamTrack) {
+                        // Fallback: create MediaStream from MediaStreamTrack
+                        var stream = new MediaStream([publication.track.mediaStreamTrack]);
+                        initCandidateAudioVisualization(stream);
+                        console.log('[AUDIO] Candidate audio visualization started (from MediaStreamTrack)');
+                    } else {
+                        console.warn('[AUDIO] No media stream available for candidate visualization');
+                    }
+                }
+            }
+
             function onDisconnected(reason) {
                 console.log('[ROOM] Disconnected:', reason);
                 state.isConnected = false;
