@@ -10,7 +10,7 @@ import os
 import time
 import logging
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify, send_from_directory, redirect, url_for
+from flask import Flask, render_template, request, jsonify, send_from_directory, redirect, url_for, session
 from flask_cors import CORS
 from livekit import api
 from dotenv import load_dotenv
@@ -18,6 +18,8 @@ from dotenv import load_dotenv
 from document_processor import doc_processor, DocumentMetadata
 from postprocess import resequence_interview, list_interviews, get_interview_summary
 from conversation_cache import conversation_cache, ConversationMetadata
+from supabase_client import supabase_client
+from auth_helpers import require_auth, get_current_user, get_user_id, is_authenticated
 
 # In-memory feedback cache
 feedback_cache = {}
@@ -32,10 +34,11 @@ logging.basicConfig(
     format='[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("flask-app")
+logger = logging.getLogger(__name__)
 
 # Create Flask app
 app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-prod')
 CORS(app)  # Enable CORS for API endpoints
 
 # Configuration from environment
@@ -52,6 +55,190 @@ if not all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
     )
 
 logger.info(f"[CONFIG] LiveKit URL: {LIVEKIT_URL}")
+
+
+# ==================== AUTH ENDPOINTS ====================
+
+@app.route('/auth/login')
+def login():
+    """Redirect to Supabase Google OAuth"""
+    try:
+        redirect_url = f"{request.host_url}auth/callback"
+        auth_url = f"{os.getenv('SUPABASE_URL')}/auth/v1/authorize?provider=google&redirect_to={redirect_url}"
+        logger.info(f"[AUTH] Redirecting to OAuth: {auth_url}")
+        return redirect(auth_url)
+    except Exception as e:
+        logger.error(f"[AUTH] Login error: {e}")
+        return "Login failed", 500
+
+@app.route('/auth/callback')
+def auth_callback():
+    """
+    Handle OAuth callback from Supabase.
+
+    Supabase returns tokens in URL fragment (#access_token=...) not query params.
+    We need to render a page that extracts tokens from fragment using JavaScript.
+    """
+    try:
+        # Log all incoming parameters for debugging
+        logger.info(f"[AUTH] Callback received - Query params: {dict(request.args)}")
+        logger.info(f"[AUTH] Callback received - Full URL: {request.url}")
+
+        # Render a page that will extract tokens from URL fragment using JavaScript
+        return render_template('auth_callback.html')
+    except Exception as e:
+        logger.error(f"[AUTH] Auth callback error: {e}", exc_info=True)
+        return "Authentication failed", 500
+
+@app.route('/auth/session', methods=['POST'])
+def set_session():
+    """Set session from tokens extracted by JavaScript"""
+    try:
+        data = request.json or {}
+        access_token = data.get('access_token')
+        refresh_token = data.get('refresh_token')
+
+        logger.info(f"[AUTH] Setting session - has access_token: {bool(access_token)}, has refresh_token: {bool(refresh_token)}")
+
+        if not access_token:
+            logger.error("[AUTH] No access token provided")
+            return jsonify({'error': 'No access token'}), 400
+
+        session['access_token'] = access_token
+        if refresh_token:
+            session['refresh_token'] = refresh_token
+
+        logger.info("[AUTH] User authenticated successfully")
+        return jsonify({
+            'success': True,
+            'redirect': url_for('dashboard')
+        })
+    except Exception as e:
+        logger.error(f"[AUTH] Set session error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/auth/logout')
+def logout():
+    """Clear session and logout"""
+    session.clear()
+    logger.info("[AUTH] User logged out")
+    return redirect(url_for('index'))
+
+@app.route('/api/auth/status')
+def auth_status():
+    """Check authentication status"""
+    try:
+        access_token = session.get('access_token')
+        logger.info(f"[AUTH] Status check - has session token: {bool(access_token)}")
+
+        user = get_current_user()
+        if user:
+            logger.info(f"[AUTH] User authenticated: {user.user.email}")
+            return jsonify({
+                'authenticated': True,
+                'user': {
+                    'id': user.user.id,
+                    'email': user.user.email,
+                    'name': user.user.user_metadata.get('full_name'),
+                    'avatar': user.user.user_metadata.get('avatar_url')
+                }
+            })
+        logger.info("[AUTH] No authenticated user found")
+        return jsonify({'authenticated': False})
+    except Exception as e:
+        logger.error(f"[AUTH] Auth status error: {e}", exc_info=True)
+        return jsonify({'authenticated': False})
+
+
+# ==================== USER API KEYS ENDPOINTS ====================
+
+@app.route('/api/user/keys/status')
+@require_auth
+def get_keys_status():
+    """Check if user has API keys configured"""
+    try:
+        user_id = get_user_id()
+        keys = supabase_client.get_api_keys(user_id)
+
+        if keys:
+            return jsonify({
+                'has_keys': True,
+                'livekit_url_masked': f"wss://{keys['livekit_url'].split('//')[1][:15]}...",
+                'livekit_key_masked': f"{keys['livekit_api_key'][:8]}...",
+                'openai_masked': f"sk-...{keys['openai_key'][-4:]}",
+                'deepgram_masked': f"...{keys['deepgram_key'][-4:]}"
+            })
+
+        return jsonify({'has_keys': False})
+    except Exception as e:
+        logger.error(f"[API] Failed to get keys status: {e}", exc_info=True)
+        return jsonify({'has_keys': False})
+
+
+@app.route('/api/user/keys', methods=['POST'])
+@require_auth
+def save_user_keys():
+    """Save user's API keys (encrypted)"""
+    try:
+        user_id = get_user_id()
+        data = request.json or {}
+
+        livekit_url = data.get('livekit_url')
+        livekit_api_key = data.get('livekit_api_key')
+        livekit_api_secret = data.get('livekit_api_secret')
+        openai_key = data.get('openai_key')
+        deepgram_key = data.get('deepgram_key')
+
+        if not all([livekit_url, livekit_api_key, livekit_api_secret, openai_key, deepgram_key]):
+            return jsonify({'error': 'All API keys required'}), 400
+
+        success = supabase_client.save_api_keys(
+            user_id, livekit_url, livekit_api_key, livekit_api_secret,
+            openai_key, deepgram_key
+        )
+
+        if success:
+            logger.info(f"[API] API keys saved for user: {user_id}")
+            return jsonify({'success': True, 'message': 'Keys saved successfully'})
+
+        return jsonify({'error': 'Failed to save keys'}), 500
+
+    except Exception as e:
+        logger.error(f"[API] Failed to save keys: {e}", exc_info=True)
+        return jsonify({'error': 'Internal error'}), 500
+
+
+@app.route('/api/user/keys/validate', methods=['POST'])
+@require_auth
+def validate_keys():
+    """Test API keys validity"""
+    try:
+        data = request.json or {}
+        livekit_url = data.get('livekit_url')
+        livekit_api_key = data.get('livekit_api_key')
+        livekit_api_secret = data.get('livekit_api_secret')
+        openai_key = data.get('openai_key')
+        deepgram_key = data.get('deepgram_key')
+
+        if not livekit_url or not (livekit_url.startswith('wss://') or livekit_url.startswith('ws://')):
+            return jsonify({'valid': False, 'message': 'Invalid LiveKit URL format'})
+
+        if not livekit_api_key or len(livekit_api_key) < 5:
+            return jsonify({'valid': False, 'message': 'Invalid LiveKit API Key'})
+
+        if not livekit_api_secret or len(livekit_api_secret) < 10:
+            return jsonify({'valid': False, 'message': 'Invalid LiveKit API Secret'})
+
+        if not openai_key or not openai_key.startswith('sk-'):
+            return jsonify({'valid': False, 'message': 'Invalid OpenAI key format'})
+
+        if not deepgram_key or len(deepgram_key) < 10:
+            return jsonify({'valid': False, 'message': 'Invalid Deepgram key format'})
+
+        return jsonify({'valid': True})
+    except Exception as e:
+        logger.error(f"[API] Key validation failed: {e}", exc_info=True)
+        return jsonify({'valid': False, 'message': 'Validation error'}), 500
 
 
 # ==================== STATIC FILES ====================
@@ -75,6 +262,22 @@ def index():
     """Landing page."""
     logger.info("[ROUTE] / - Landing page accessed")
     return render_template('index.html')
+
+
+@app.route('/dashboard')
+@require_auth
+def dashboard():
+    """User dashboard (protected)."""
+    logger.info("[ROUTE] /dashboard - Dashboard accessed")
+    return render_template('dashboard.html')
+
+
+@app.route('/api-keys')
+@require_auth
+def api_keys_page():
+    """API keys management page (protected)."""
+    logger.info("[ROUTE] /api-keys - API keys page accessed")
+    return render_template('api_keys.html')
 
 
 @app.route('/start')
