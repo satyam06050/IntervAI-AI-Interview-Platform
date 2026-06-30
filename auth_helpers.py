@@ -7,7 +7,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 url = os.getenv('SUPABASE_URL')
-anon_key = os.getenv('SUPABASE_KEY')
+anon_key = os.getenv('SUPABASE_ANON_KEY')
 supabase = create_client(url, anon_key)
 
 def get_current_user():
