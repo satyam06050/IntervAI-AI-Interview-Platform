@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 class SupabaseClient:
     def __init__(self):
         url = os.getenv('SUPABASE_URL')
-        key = os.getenv('SUPABASE_KEY')
+        key = os.getenv('SUPABASE_SERVICE_KEY')
 
         if not url or not key:
             raise ValueError("Missing Supabase credentials in environment")
@@ -172,6 +172,15 @@ class SupabaseClient:
             return response.data[0] if response.data else None
         except Exception as e:
             logger.error(f"Error fetching interview by room name: {e}")
+            return None
+
+    def get_interview_by_id(self, user_id: str, interview_id: str) -> Optional[Dict[str, Any]]:
+        """Get interview by ID for specific user"""
+        try:
+            response = self.client.table('interviews').select('*').eq('id', interview_id).eq('user_id', user_id).execute()
+            return response.data[0] if response.data else None
+        except Exception as e:
+            logger.error(f"Error fetching interview by ID: {e}", exc_info=True)
             return None
 
     def save_feedback(self, user_id: str, interview_id: str, feedback_data: Dict[str, Any]) -> bool:
