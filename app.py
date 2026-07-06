@@ -9,6 +9,7 @@ interview history, and feedback endpoints.
 import os
 import time
 import logging
+import atexit
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory, redirect, url_for, session
 from flask_cors import CORS
@@ -20,6 +21,7 @@ from postprocess import list_interviews, get_interview_summary
 from conversation_cache import conversation_cache, ConversationMetadata
 from supabase_client import supabase_client
 from auth_helpers import require_auth, get_current_user, get_user_id, is_authenticated
+from worker_manager import worker_manager
 
 # In-memory feedback cache
 feedback_cache = {}
@@ -41,20 +43,30 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-prod')
 CORS(app)  # Enable CORS for API endpoints
 
-# Configuration from environment
-LIVEKIT_URL = os.getenv('LIVEKIT_URL')
-LIVEKIT_API_KEY = os.getenv('LIVEKIT_API_KEY')
-LIVEKIT_API_SECRET = os.getenv('LIVEKIT_API_SECRET')
+# Register cleanup on server shutdown
+atexit.register(worker_manager.cleanup_all_workers)
 
-# Validate configuration
-if not all([LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET]):
-    logger.error("[CONFIG] Missing required LiveKit environment variables")
-    raise ValueError(
-        "Missing required environment variables. "
-        "Please set LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET"
-    )
+# Validate required environment variables for production (BYOK keys NOT included)
+required_env_vars = [
+    'SUPABASE_URL',
+    'SUPABASE_SERVICE_KEY',
+    'SUPABASE_ANON_KEY',
+    'ENCRYPTION_KEY',
+    'SECRET_KEY',
+    'GOOGLE_CLIENT_ID',
+    'GOOGLE_CLIENT_SECRET'
+]
 
-logger.info(f"[CONFIG] LiveKit URL: {LIVEKIT_URL}")
+missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+if missing_vars:
+    logger.error(f"[CONFIG] Missing required environment variables: {', '.join(missing_vars)}")
+    if os.getenv('FLASK_ENV') == 'production':  # Only fail in production
+        raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    else:
+        logger.warning("[CONFIG] Missing vars detected but continuing in dev mode")
+
+logger.info("[CONFIG] All required environment variables validated")
+logger.info("[CONFIG] BYOK model: LiveKit, OpenAI, and Deepgram keys loaded from user database")
 
 
 # ==================== AUTH ENDPOINTS ====================
@@ -343,39 +355,19 @@ def feedback_page(filename):
 @require_auth
 def generate_token():
     """
-    Generate LiveKit access token for candidate.
+    Spawn agent worker and generate LiveKit token.
 
-    Requires authentication - user must be logged in to start an interview.
-
-    Expected JSON body:
-    {
-        "name": "Candidate Name",
-        "email": "email@example.com",
-        "role": "Software Engineer",
-        "level": "mid",
-        "resumeCacheKey": "optional_cache_key",
-        "jobDescription": "optional_jd_text",
-        "includeProfile": true
-    }
-
-    Returns:
-    {
-        "token": "jwt_token",
-        "url": "wss://livekit.server.com",
-        "room": "interview-name-timestamp"
-    }
+    This endpoint:
+    1. Validates user has API keys
+    2. Spawns dedicated agent worker subprocess with user's keys
+    3. Waits for worker ready signal
+    4. Generates LiveKit token
+    5. Returns token + room info
     """
     try:
-        # Get authenticated user_id
         user_id = get_user_id()
-        if not user_id:
-            logger.error("[API] Token generation failed - no user_id")
-            return jsonify({
-                'error': 'Authentication required',
-                'message': 'Please log in to start an interview'
-            }), 401
+        data = request.json or {}
 
-        data = request.json
         name = data.get('name', 'Anonymous')
         email = data.get('email', '')
         role = data.get('role', '')
@@ -384,16 +376,55 @@ def generate_token():
         job_description = data.get('jobDescription', '')
         include_profile = data.get('includeProfile', True)
 
+        logger.info(f"[TOKEN] Token request from user {user_id} ({name})")
+
+        # Get user's API keys from database
+        keys = supabase_client.get_api_keys(user_id)
+
+        if not keys:
+            logger.error(f"[TOKEN] No API keys found for user: {user_id}")
+            return jsonify({
+                'error': 'API keys not configured',
+                'message': 'Please configure your API keys in Settings before starting an interview.'
+            }), 400
+
+        # Validate keys are present
+        required_keys = ['livekit_url', 'livekit_api_key', 'livekit_api_secret', 'openai_key', 'deepgram_key']
+        missing_keys = [k for k in required_keys if not keys.get(k)]
+
+        if missing_keys:
+            logger.error(f"[TOKEN] Missing keys for user {user_id}: {missing_keys}")
+            return jsonify({
+                'error': 'Incomplete API keys',
+                'message': f'Missing keys: {", ".join(missing_keys)}'
+            }), 400
+
         # Create unique room name
         timestamp = int(time.time())
         room_name = f"interview-{name.lower().replace(' ', '-')}-{timestamp}"
 
-        logger.info(
-            f"[API] Token generation requested for {name} (user_id: {user_id}) "
-            f"(email: {email}, role: {role}, level: {level})"
+        logger.info(f"[TOKEN] Spawning worker for room: {room_name}")
+
+        # Spawn agent worker subprocess with user's API keys
+        worker_started = worker_manager.spawn_worker(
+            room_name=room_name,
+            livekit_url=keys['livekit_url'],
+            livekit_api_key=keys['livekit_api_key'],
+            livekit_api_secret=keys['livekit_api_secret'],
+            openai_api_key=keys['openai_key'],
+            deepgram_api_key=keys['deepgram_key']
         )
 
-        # Build participant attributes - CRITICAL: include user_id for database save
+        if not worker_started:
+            logger.error(f"[TOKEN] Worker failed to start for room: {room_name}")
+            return jsonify({
+                'error': 'Worker startup failed',
+                'message': 'Failed to start interview agent. Please try again.'
+            }), 500
+
+        logger.info(f"[TOKEN] Worker ready for room: {room_name}")
+
+        # Build participant attributes (without API keys - already in worker)
         attributes = {
             'user_id': user_id,
             'role': role,
@@ -406,22 +437,20 @@ def generate_token():
         if resume_cache_key:
             resume_text = doc_processor.get_cached_text(resume_cache_key)
             if resume_text:
-                # Truncate to fit in attributes (LiveKit has limits)
                 attributes['resume_text'] = resume_text[:3000]
-                logger.info(f"[API] Attached resume text ({len(resume_text)} chars)")
+                logger.info(f"[TOKEN] Attached resume text ({len(resume_text)} chars)")
 
         # Add job description if provided
         if job_description:
             attributes['job_description'] = job_description[:2000]
-            logger.info(f"[API] Attached job description ({len(job_description)} chars)")
+            logger.info(f"[TOKEN] Attached job description ({len(job_description)} chars)")
 
-        # Create LiveKit access token
+        # Create LiveKit access token using USER'S keys
         token = api.AccessToken(
-            LIVEKIT_API_KEY,
-            LIVEKIT_API_SECRET
+            keys['livekit_api_key'],
+            keys['livekit_api_secret']
         )
 
-        # Set identity and grants with metadata
         token.with_identity(name).with_name(name).with_grants(
             api.VideoGrants(
                 room_join=True,
@@ -434,11 +463,11 @@ def generate_token():
         # Generate JWT
         jwt_token = token.to_jwt()
 
-        logger.info(f"[API] Token generated successfully for room: {room_name} (user_id: {user_id})")
+        logger.info(f"[TOKEN] Token generated successfully for room: {room_name}")
 
         return jsonify({
             'token': jwt_token,
-            'url': LIVEKIT_URL,
+            'url': keys['livekit_url'],
             'room': room_name,
             'candidate': {
                 'name': name,
@@ -449,11 +478,28 @@ def generate_token():
         })
 
     except Exception as e:
-        logger.error(f"[API] Token generation error: {e}", exc_info=True)
+        logger.error(f"[TOKEN] Token generation error: {e}", exc_info=True)
         return jsonify({
-            'error': 'Failed to generate token',
+            'error': 'Token generation failed',
             'message': str(e)
         }), 500
+
+
+@app.route('/api/worker/status/<room_name>')
+@require_auth
+def worker_status(room_name):
+    """Check worker status for room"""
+    try:
+        status = worker_manager.get_worker_status(room_name)
+
+        return jsonify({
+            'room_name': room_name,
+            'status': status or 'not_found'
+        })
+
+    except Exception as e:
+        logger.error(f"[WORKER] Status check error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 # ==================== DOCUMENT UPLOAD API ====================
@@ -1034,6 +1080,7 @@ def _load_interview_context(interview_id):
 
 
 @app.route('/api/feedback/scores', methods=['POST'])
+@require_auth
 def generate_feedback_scores():
     """
     Stage 1: Extract structured competency scores from interview.
@@ -1075,18 +1122,20 @@ def generate_feedback_scores():
             job_summary=job_summary,
             interview_chat=interview_chat
         )
-        
-        # Call OpenAI API for scores extraction
-        openai_api_key = os.getenv('OPENAI_API_KEY')
-        if not openai_api_key:
+
+        # Get authenticated user's OpenAI key from database (BYOK model)
+        user_id = get_user_id()
+        keys = supabase_client.get_api_keys(user_id)
+
+        if not keys or not keys.get('openai_key'):
             return jsonify({
-                'error': 'Configuration error',
-                'message': 'OpenAI API key not configured'
-            }), 500
-        
+                'error': 'API key not configured',
+                'message': 'Please configure your OpenAI API key in Settings'
+            }), 400
+
         logger.info(f"[API] Extracting scores via OpenAI for {interview_id}")
-        
-        client = OpenAI(api_key=openai_api_key)
+
+        client = OpenAI(api_key=keys['openai_key'])
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1151,6 +1200,7 @@ def generate_feedback_scores():
 
 
 @app.route('/api/feedback', methods=['POST'])
+@require_auth
 def generate_feedback():
     """
     Stage 2: Generate detailed AI-powered feedback using chain-of-thought analysis.
@@ -1206,17 +1256,19 @@ def generate_feedback():
 
 Provide your analysis and feedback following the output format specified."""
 
-        # Call OpenAI API for feedback generation
-        openai_api_key = os.getenv('OPENAI_API_KEY')
-        if not openai_api_key:
+        # Get authenticated user's OpenAI key from database (BYOK model)
+        user_id = get_user_id()
+        keys = supabase_client.get_api_keys(user_id)
+
+        if not keys or not keys.get('openai_key'):
             return jsonify({
-                'error': 'Configuration error',
-                'message': 'OpenAI API key not configured'
-            }), 500
-        
+                'error': 'API key not configured',
+                'message': 'Please configure your OpenAI API key in Settings'
+            }), 400
+
         logger.info(f"[API] Generating feedback via OpenAI for {interview_id}")
-        
-        client = OpenAI(api_key=openai_api_key)
+
+        client = OpenAI(api_key=keys['openai_key'])
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1332,16 +1384,40 @@ def skip_stage():
 
 # ==================== HEALTH CHECK ====================
 
-@app.route('/api/health')
+
+@app.route('/health')
 def health_check():
-    """Health check endpoint for monitoring."""
-    return jsonify({
-        'status': 'healthy',
-        'service': 'MockFlow-AI',
-        'livekit_configured': bool(LIVEKIT_URL and LIVEKIT_API_KEY),
-        'document_cache_stats': doc_processor.get_cache_stats(),
-        'conversation_cache_stats': conversation_cache.get_cache_stats()
-    })
+    """Health check endpoint for monitoring and deployment verification."""
+    try:
+        # Check database connection by attempting to query
+        # This will fail if database is unreachable
+        from supabase_client import supabase_client
+
+        # Test database connectivity (query will return None for non-existent user, but connection works)
+        supabase_client.get_user('health-check-test-user-id')
+
+        # Count active workers
+        active_worker_count = len(worker_manager.active_workers)
+        max_workers = worker_manager.max_workers
+
+        logger.info(f"[HEALTH] Health check passed - {active_worker_count}/{max_workers} workers active")
+
+        return jsonify({
+            'status': 'healthy',
+            'database': 'connected',
+            'workers': {
+                'active': active_worker_count,
+                'max': max_workers
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[HEALTH] Health check failed: {e}", exc_info=True)
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e)
+        }), 500
+
 
 
 # ==================== ERROR HANDLERS ====================
@@ -1371,5 +1447,6 @@ if __name__ == '__main__':
     app.run(
         debug=True,
         port=5000,
-        host='0.0.0.0'
+        host='0.0.0.0',
+        use_reloader=False  # Disable auto-reload to prevent killing spawned workers
     )
