@@ -7,20 +7,32 @@ interview history, and feedback endpoints.
 """
 
 import os
+import re
 import time
+import uuid
 import logging
 import atexit
+import secrets
+from datetime import timedelta
 from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory, redirect, url_for, session
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from livekit import api
 from dotenv import load_dotenv
 
 from document_processor import doc_processor, DocumentMetadata
-from postprocess import list_interviews, get_interview_summary
+from postprocess import list_interviews, get_interview_summary, merge_by_agent_turns
 from conversation_cache import conversation_cache, ConversationMetadata
-from supabase_client import supabase_client
-from auth_helpers import require_auth, get_current_user, get_user_id, is_authenticated
+from db import db_client as supabase_client
+from auth_helpers import (
+    init_auth,
+    register_auth_routes,
+    require_auth,
+    get_current_user,
+    get_user_id,
+    is_authenticated,
+)
 from worker_manager import worker_manager
 
 # In-memory feedback cache
@@ -40,24 +52,59 @@ logger = logging.getLogger(__name__)
 
 # Create Flask app
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-prod')
-CORS(app)  # Enable CORS for API endpoints
+# No hardcoded fallback: production fails loudly below if SECRET_KEY is unset;
+# dev gets an ephemeral random key (assigned after env validation).
+app.secret_key = os.getenv('SECRET_KEY')
+
+_is_prod = os.getenv('FLASK_ENV') == 'production'
+app.config.update(
+    # Session + remember-me cookie hardening. Secure flag only in production so
+    # local http development keeps working.
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=_is_prod,
+    REMEMBER_COOKIE_HTTPONLY=True,
+    REMEMBER_COOKIE_SAMESITE='Lax',
+    REMEMBER_COOKIE_SECURE=_is_prod,
+    REMEMBER_COOKIE_DURATION=timedelta(days=7),
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+    # Cap request bodies/uploads to keep a single Render instance from OOMing.
+    MAX_CONTENT_LENGTH=10 * 1024 * 1024,  # 10 MB
+)
+
+# Honor X-Forwarded-Proto / X-Forwarded-Host from Render's reverse proxy so
+# url_for(..., _external=True) produces https URLs (OAuth redirect_uri must match exactly).
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
+# Scope CORS to known origins (was a wildcard). Set CORS_ORIGINS (comma-separated)
+# to the deployed domain, e.g. https://mockflow-ai.onrender.com.
+_default_origins = "http://localhost:5000,http://127.0.0.1:5000"
+_allowed_origins = [
+    o.strip() for o in os.getenv('CORS_ORIGINS', _default_origins).split(',') if o.strip()
+]
+CORS(app, resources={r"/api/*": {"origins": _allowed_origins}}, supports_credentials=True)
+
+# Authlib + Flask-Login (replaces Supabase Auth)
+init_auth(app)
+register_auth_routes(app)
 
 # Register cleanup on server shutdown
 atexit.register(worker_manager.cleanup_all_workers)
 
-# Validate required environment variables for production (BYOK keys NOT included)
+# Validate required environment variables for production (BYOK keys NOT included).
+# Each entry is a tuple of acceptable env var names; the first set value satisfies it.
 required_env_vars = [
-    'SUPABASE_URL',
-    'SUPABASE_SERVICE_KEY',
-    'SUPABASE_ANON_KEY',
-    'ENCRYPTION_KEY',
-    'SECRET_KEY',
-    'GOOGLE_CLIENT_ID',
-    'GOOGLE_CLIENT_SECRET'
+    ('DATABASE_URL',),
+    ('ENCRYPTION_KEY',),
+    ('SECRET_KEY',),
+    ('GOOGLE_CLIENT_ID',),
+    ('GOOGLE_CLIENT_SECRET', 'GOOGLE_CLOUD_CLIENT_SECRET'),
 ]
 
-missing_vars = [var for var in required_env_vars if not os.getenv(var)]
+missing_vars = [
+    names[0] for names in required_env_vars
+    if not any(os.getenv(n) for n in names)
+]
 if missing_vars:
     logger.error(f"[CONFIG] Missing required environment variables: {', '.join(missing_vars)}")
     if os.getenv('FLASK_ENV') == 'production':  # Only fail in production
@@ -68,98 +115,108 @@ if missing_vars:
 logger.info("[CONFIG] All required environment variables validated")
 logger.info("[CONFIG] BYOK model: LiveKit, OpenAI, and Deepgram keys loaded from user database")
 
+# Dev-only ephemeral secret. Production already raised above if SECRET_KEY was
+# missing; here we ensure local dev never runs with a known constant key.
+if not app.secret_key:
+    app.secret_key = secrets.token_hex(32)
+    logger.warning("[CONFIG] SECRET_KEY not set; using an ephemeral random dev key (sessions reset on restart).")
+
+
+@app.after_request
+def set_security_headers(response):
+    """Defensive headers applied to every response."""
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    # Anti-clickjacking via CSP too (defense in depth). A full content CSP is
+    # deferred to the UI overhaul so it can be screenshot-verified against the
+    # inline scripts and CDN assets the templates rely on.
+    response.headers.setdefault('Content-Security-Policy', "frame-ancestors 'none'")
+    if _is_prod:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
+
+
+def _safe_room_component(name: str) -> str:
+    """Lowercase slug containing only [a-z0-9-]; never empty. Used in room names."""
+    slug = re.sub(r'[^a-z0-9-]', '', (name or '').lower().replace(' ', '-')).strip('-')
+    return slug or 'candidate'
+
+
+# ==================== FREE TIER (owner-funded trial interviews) ====================
+# When enabled, a new user gets a small number of interviews on the OWNER's keys
+# (SYSTEM_* env vars) before they must bring their own. Bounded per verified email
+# and by a global monthly ceiling (kill-switch). Off unless FREE_TIER_ENABLED=true.
+
+FREE_TIER_ENABLED = os.getenv('FREE_TIER_ENABLED', 'false').lower() == 'true'
+FREE_TIER_MONTHLY_MAX_CALLS = int(os.getenv('FREE_TIER_MONTHLY_MAX_CALLS', '500'))
+
+_SYSTEM_KEY_SHAPE = (
+    ('livekit_url', 'SYSTEM_LIVEKIT_URL'),
+    ('livekit_api_key', 'SYSTEM_LIVEKIT_API_KEY'),
+    ('livekit_api_secret', 'SYSTEM_LIVEKIT_API_SECRET'),
+    ('openai_key', 'SYSTEM_OPENAI_KEY'),
+    ('deepgram_key', 'SYSTEM_DEEPGRAM_KEY'),
+)
+_BYOK_REQUIRED = ('livekit_url', 'livekit_api_key', 'livekit_api_secret', 'openai_key', 'deepgram_key')
+
+
+def _system_keys():
+    """Owner-funded keys (same shape as get_api_keys), or None if not fully set."""
+    keys = {field: os.getenv(env) for field, env in _SYSTEM_KEY_SHAPE}
+    return keys if all(keys.values()) else None
+
+
+def _current_month() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime('%Y-%m')
+
+
+def free_tier_available(user_id: str) -> bool:
+    """True if the owner-funded free tier can serve this user right now."""
+    if not FREE_TIER_ENABLED or _system_keys() is None:
+        return False
+    if supabase_client.free_calls_this_month(_current_month()) >= FREE_TIER_MONTHLY_MAX_CALLS:
+        logger.warning("[FREE] Monthly free-tier ceiling reached; free calls paused")
+        return False
+    used, granted = supabase_client.get_free_calls(user_id)
+    return used < granted
+
+
+def resolve_interview_keys(user_id: str):
+    """
+    Decide which keys fund this interview.
+    Returns (keys|None, is_free_call, error|None) where error is a plain
+    (body_dict, status_code) tuple the caller serializes with jsonify.
+    Prefer the user's complete BYOK set; otherwise the owner free tier.
+    """
+    byok = supabase_client.get_api_keys(user_id)
+    if byok and all(byok.get(k) for k in _BYOK_REQUIRED):
+        return byok, False, None
+    if free_tier_available(user_id):
+        return _system_keys(), True, None
+    if FREE_TIER_ENABLED:
+        msg = 'Add your API keys in Settings, or you have used all your free interviews.'
+    else:
+        msg = 'Please configure your API keys in Settings before starting an interview.'
+    return None, False, ({'error': 'API keys not configured', 'message': msg}, 400)
+
+
+def resolve_openai_key(user_id: str):
+    """OpenAI key for server-side LLM calls: user's BYOK, else owner key (free tier)."""
+    byok = supabase_client.get_api_keys(user_id)
+    if byok and byok.get('openai_key'):
+        return byok['openai_key']
+    if FREE_TIER_ENABLED:
+        sysk = _system_keys()
+        if sysk:
+            return sysk['openai_key']
+    return None
+
 
 # ==================== AUTH ENDPOINTS ====================
-
-@app.route('/auth/login')
-def login():
-    """Redirect to Supabase Google OAuth"""
-    try:
-        redirect_url = f"{request.host_url}auth/callback"
-        auth_url = f"{os.getenv('SUPABASE_URL')}/auth/v1/authorize?provider=google&redirect_to={redirect_url}"
-        logger.info(f"[AUTH] Redirecting to OAuth: {auth_url}")
-        return redirect(auth_url)
-    except Exception as e:
-        logger.error(f"[AUTH] Login error: {e}")
-        return "Login failed", 500
-
-@app.route('/auth/callback')
-def auth_callback():
-    """
-    Handle OAuth callback from Supabase.
-
-    Supabase returns tokens in URL fragment (#access_token=...) not query params.
-    We need to render a page that extracts tokens from fragment using JavaScript.
-    """
-    try:
-        # Log all incoming parameters for debugging
-        logger.info(f"[AUTH] Callback received - Query params: {dict(request.args)}")
-        logger.info(f"[AUTH] Callback received - Full URL: {request.url}")
-
-        # Render a page that will extract tokens from URL fragment using JavaScript
-        return render_template('auth_callback.html')
-    except Exception as e:
-        logger.error(f"[AUTH] Auth callback error: {e}", exc_info=True)
-        return "Authentication failed", 500
-
-@app.route('/auth/session', methods=['POST'])
-def set_session():
-    """Set session from tokens extracted by JavaScript"""
-    try:
-        data = request.json or {}
-        access_token = data.get('access_token')
-        refresh_token = data.get('refresh_token')
-
-        logger.info(f"[AUTH] Setting session - has access_token: {bool(access_token)}, has refresh_token: {bool(refresh_token)}")
-
-        if not access_token:
-            logger.error("[AUTH] No access token provided")
-            return jsonify({'error': 'No access token'}), 400
-
-        session['access_token'] = access_token
-        if refresh_token:
-            session['refresh_token'] = refresh_token
-
-        logger.info("[AUTH] User authenticated successfully")
-        return jsonify({
-            'success': True,
-            'redirect': url_for('dashboard')
-        })
-    except Exception as e:
-        logger.error(f"[AUTH] Set session error: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/auth/logout')
-def logout():
-    """Clear session and logout"""
-    session.clear()
-    logger.info("[AUTH] User logged out")
-    return redirect(url_for('index'))
-
-@app.route('/api/auth/status')
-def auth_status():
-    """Check authentication status"""
-    try:
-        access_token = session.get('access_token')
-        logger.info(f"[AUTH] Status check - has session token: {bool(access_token)}")
-
-        user = get_current_user()
-        if user:
-            logger.info(f"[AUTH] User authenticated: {user.user.email}")
-            return jsonify({
-                'authenticated': True,
-                'user': {
-                    'id': user.user.id,
-                    'email': user.user.email,
-                    'name': user.user.user_metadata.get('full_name'),
-                    'avatar': user.user.user_metadata.get('avatar_url')
-                }
-            })
-        logger.info("[AUTH] No authenticated user found")
-        return jsonify({'authenticated': False})
-    except Exception as e:
-        logger.error(f"[AUTH] Auth status error: {e}", exc_info=True)
-        return jsonify({'authenticated': False})
+# /auth/login, /auth/google/callback, /auth/logout, /api/auth/status
+# are registered in auth_helpers.register_auth_routes(app) above.
 
 
 # ==================== USER API KEYS ENDPOINTS ====================
@@ -171,20 +228,40 @@ def get_keys_status():
     try:
         user_id = get_user_id()
         keys = supabase_client.get_api_keys(user_id)
+        used, granted = supabase_client.get_free_calls(user_id)
+        free_remaining = max(0, granted - used)
 
         if keys:
             return jsonify({
                 'has_keys': True,
+                'free_calls_remaining': free_remaining,
                 'livekit_url_masked': f"wss://{keys['livekit_url'].split('//')[1][:15]}...",
                 'livekit_key_masked': f"{keys['livekit_api_key'][:8]}...",
                 'openai_masked': f"sk-...{keys['openai_key'][-4:]}",
                 'deepgram_masked': f"...{keys['deepgram_key'][-4:]}"
             })
 
-        return jsonify({'has_keys': False})
+        return jsonify({'has_keys': False, 'free_calls_remaining': free_remaining})
     except Exception as e:
         logger.error(f"[API] Failed to get keys status: {e}", exc_info=True)
-        return jsonify({'has_keys': False})
+        return jsonify({'has_keys': False, 'free_calls_remaining': 0})
+
+
+@app.route('/api/user/stats')
+@require_auth
+def user_stats():
+    """Aggregate dashboard stats for the authenticated user (count, tracks, avg score, free calls)."""
+    try:
+        user_id = get_user_id()
+        stats = supabase_client.get_user_stats(user_id) or {}
+        used, granted = supabase_client.get_free_calls(user_id)
+        stats['free_calls_used'] = used
+        stats['free_calls_granted'] = granted
+        stats['free_calls_remaining'] = max(0, granted - used)
+        return jsonify(stats)
+    except Exception as e:
+        logger.error(f"[API] Failed to build user stats: {e}", exc_info=True)
+        return jsonify({'total_interviews': 0, 'tracks': {}, 'free_calls_remaining': 0}), 200
 
 
 @app.route('/api/user/keys', methods=['POST'])
@@ -375,33 +452,27 @@ def generate_token():
         resume_cache_key = data.get('resumeCacheKey', '')
         job_description = data.get('jobDescription', '')
         include_profile = data.get('includeProfile', True)
+        track = data.get('track', 'intro')
+        framework = data.get('framework', 'amazon')
+        depth = data.get('depth', 'medium')
+        custom_questions = data.get('customQuestions', '')
+        topics = data.get('topics', [])
+        custom_topics = data.get('customTopics', [])
 
         logger.info(f"[TOKEN] Token request from user {user_id} ({name})")
 
-        # Get user's API keys from database
-        keys = supabase_client.get_api_keys(user_id)
-
-        if not keys:
-            logger.error(f"[TOKEN] No API keys found for user: {user_id}")
-            return jsonify({
-                'error': 'API keys not configured',
-                'message': 'Please configure your API keys in Settings before starting an interview.'
-            }), 400
-
-        # Validate keys are present
-        required_keys = ['livekit_url', 'livekit_api_key', 'livekit_api_secret', 'openai_key', 'deepgram_key']
-        missing_keys = [k for k in required_keys if not keys.get(k)]
-
-        if missing_keys:
-            logger.error(f"[TOKEN] Missing keys for user {user_id}: {missing_keys}")
-            return jsonify({
-                'error': 'Incomplete API keys',
-                'message': f'Missing keys: {", ".join(missing_keys)}'
-            }), 400
+        # Resolve interview keys: the user's BYOK set, or the owner-funded free tier.
+        keys, is_free_call, key_error = resolve_interview_keys(user_id)
+        if key_error is not None:
+            logger.error(f"[TOKEN] No usable keys for user: {user_id}")
+            body, status = key_error
+            return jsonify(body), status
+        if is_free_call:
+            logger.info(f"[TOKEN] Free-tier interview for user {user_id} (owner keys)")
 
         # Create unique room name
         timestamp = int(time.time())
-        room_name = f"interview-{name.lower().replace(' ', '-')}-{timestamp}"
+        room_name = f"interview-{_safe_room_component(name)}-{timestamp}"
 
         logger.info(f"[TOKEN] Spawning worker for room: {room_name}")
 
@@ -424,6 +495,11 @@ def generate_token():
 
         logger.info(f"[TOKEN] Worker ready for room: {room_name}")
 
+        # Claim the free credit only after a successful spawn (abandoned setups
+        # before this point don't burn an interview).
+        if is_free_call:
+            supabase_client.consume_free_call(user_id, _current_month())
+
         # Build participant attributes (without API keys - already in worker)
         attributes = {
             'user_id': user_id,
@@ -431,6 +507,13 @@ def generate_token():
             'level': level,
             'email': email,
             'include_profile': str(include_profile).lower(),
+            'track': track,
+            'framework': framework,
+            'depth': depth,
+            'custom_questions': custom_questions,
+            'topics': ','.join(topics) if isinstance(topics, list) else topics,
+            'custom_topics': ','.join(custom_topics) if isinstance(custom_topics, list) else custom_topics,
+            'is_free_call': str(is_free_call).lower(),
         }
 
         # Add resume text if cached
@@ -485,6 +568,122 @@ def generate_token():
         }), 500
 
 
+@app.route('/api/extract-topics', methods=['POST'])
+@require_auth
+def extract_topics():
+    """Extract technology topics from cached resume text using LLM."""
+    try:
+        data = request.json or {}
+        cache_key = data.get('cache_key', '')
+        role = data.get('role', 'Software Engineer')
+
+        if not cache_key:
+            return jsonify({'topics': []})
+
+        resume_text = doc_processor.get_cached_text(cache_key)
+        if not resume_text:
+            return jsonify({'topics': []})
+
+        user_id = get_user_id()
+        openai_key = resolve_openai_key(user_id)
+        if not openai_key:
+            return jsonify({'topics': []})
+
+        from openai import OpenAI
+        client = OpenAI(api_key=openai_key)
+
+        from prompts import QUESTION_GENERATION
+        prompt = QUESTION_GENERATION.topic_extraction_system.format(
+            role=role,
+            text=resume_text[:3000]
+        )
+
+        response = client.chat.completions.create(
+            model='gpt-4o-mini',
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.3,
+            max_tokens=200,
+        )
+
+        import json as _json
+        raw = response.choices[0].message.content.strip()
+        parsed = _json.loads(raw)
+        topics = parsed.get('topics', [])[:10]
+
+        logger.info(f"[TOPICS] Extracted {len(topics)} topics from resume for user {user_id}")
+        return jsonify({'topics': topics})
+
+    except Exception as e:
+        logger.error(f"[TOPICS] Failed to extract topics: {e}")
+        return jsonify({'topics': []})
+
+
+@app.route('/api/coding/submit', methods=['POST'])
+@require_auth
+def submit_code():
+    """
+    Store a code submission to the coding_submissions table.
+
+    Called by agent_worker after evaluating submitted code.
+
+    Expected JSON body:
+        - interview_id: The interview database ID
+        - problem_title: Title of the coding problem
+        - problem_description: Full problem description
+        - language: Programming language used
+        - code_submitted: The candidate's code
+        - attempt_number: Attempt number (1-3)
+        - evaluation_result: JSON evaluation from CODE_EVALUATOR
+        - time_spent_seconds: Optional time spent on this attempt
+    """
+    try:
+        data = request.json or {}
+        user_id = get_user_id()
+
+        interview_id = data.get('interview_id')
+        problem_title = data.get('problem_title', 'Coding Problem')
+        problem_description = data.get('problem_description', '')
+        language = data.get('language', 'python')
+        code_submitted = data.get('code_submitted', '')
+        attempt_number = data.get('attempt_number', 1)
+        evaluation_result = data.get('evaluation_result', {})
+        time_spent_seconds = data.get('time_spent_seconds')
+
+        if not interview_id:
+            return jsonify({'error': 'Missing interview_id'}), 400
+
+        try:
+            uuid.UUID(str(interview_id))
+        except (ValueError, AttributeError, TypeError):
+            return jsonify({'error': 'Invalid interview ID'}), 400
+
+        if not code_submitted:
+            return jsonify({'error': 'No code submitted'}), 400
+
+        logger.info(f"[API] Saving coding submission for interview {interview_id}, attempt {attempt_number}")
+
+        submission_id = supabase_client.save_coding_submission(
+            user_id=user_id,
+            interview_id=interview_id,
+            problem_title=problem_title,
+            problem_description=problem_description,
+            language=language,
+            code_submitted=code_submitted,
+            attempt_number=attempt_number,
+            evaluation_result=evaluation_result,
+            time_spent_seconds=time_spent_seconds,
+        )
+
+        if submission_id:
+            return jsonify({'success': True, 'submission_id': submission_id})
+        else:
+            return jsonify({'success': False, 'message': 'Failed to save submission'}), 500
+
+    except Exception as e:
+        logger.error(f"[API] Code submission error: {e}", exc_info=True)
+        return jsonify({'error': 'Submission failed', 'message': str(e)}), 500
+
+
 @app.route('/api/worker/status/<room_name>')
 @require_auth
 def worker_status(room_name):
@@ -505,6 +704,7 @@ def worker_status(room_name):
 # ==================== DOCUMENT UPLOAD API ====================
 
 @app.route('/api/upload-resume', methods=['POST'])
+@require_auth
 def upload_resume():
     """
     Upload and extract text from resume/portfolio/job description.
@@ -600,6 +800,7 @@ def upload_resume():
 # ==================== CONVERSATION CACHE API ====================
 
 @app.route('/api/conversation/cache', methods=['POST'])
+@require_auth
 def cache_conversation():
     """
     Cache a conversation from the agent.
@@ -670,6 +871,7 @@ def cache_conversation():
 
 
 @app.route('/api/conversation/<cache_key>')
+@require_auth
 def get_cached_conversation(cache_key):
     """Get a cached conversation by key."""
     try:
@@ -725,7 +927,7 @@ def get_user_interviews():
     """Get authenticated user's interview history from database"""
     try:
         user_id = get_user_id()
-        limit = request.args.get('limit', 50, type=int)
+        limit = max(1, min(request.args.get('limit', 50, type=int), 100))
 
         # First, claim any unclaimed interviews in localStorage
         claim_local_interviews(user_id)
@@ -872,34 +1074,28 @@ def get_feedback_by_id(interview_id):
         return jsonify({}), 500
 
 
-def format_conversation(conversation_dict):
-    """Convert DB conversation format to ordered list for frontend"""
+def format_conversation_with_merge(conversation_dict):
+    """
+    Convert DB conversation format to ordered list for frontend.
+    Uses merge_by_agent_turns to properly group user partial transcripts.
+
+    Args:
+        conversation_dict: {'agent': [...], 'user': [...]}
+
+    Returns:
+        List of merged conversation turns in chronological order
+    """
     try:
         agent_msgs = conversation_dict.get('agent', [])
         user_msgs = conversation_dict.get('user', [])
 
-        # Merge by timestamp
-        all_msgs = []
+        if not agent_msgs and not user_msgs:
+            return []
 
-        for msg in agent_msgs:
-            all_msgs.append({
-                'role': 'agent',
-                'text': msg.get('text', ''),
-                'timestamp': msg.get('timestamp', 0),
-                'stage': msg.get('stage', '')
-            })
+        # Use postprocess merge function for proper grouping
+        merged_turns = merge_by_agent_turns(agent_msgs, user_msgs)
 
-        for msg in user_msgs:
-            all_msgs.append({
-                'role': 'user',
-                'text': msg.get('text', ''),
-                'timestamp': msg.get('timestamp', 0)
-            })
-
-        # Sort by timestamp
-        all_msgs.sort(key=lambda x: x.get('timestamp', 0))
-
-        return all_msgs
+        return merged_turns
 
     except Exception as e:
         logger.error(f"[FORMAT] Conversation format error: {e}", exc_info=True)
@@ -909,7 +1105,20 @@ def format_conversation(conversation_dict):
 @app.route('/api/interview/<interview_id>')
 @require_auth
 def get_interview(interview_id):
-    """Get interview by ID from database"""
+    """
+    Get interview by ID with properly merged transcript.
+
+    Returns:
+        {
+            "ordered_conversation": [...],  # Merged turns
+            "meta": {
+                "candidate": "...",
+                "interview_date": "...",
+                "stages_covered": [...],
+                ...
+            }
+        }
+    """
     try:
         user_id = get_user_id()
 
@@ -920,33 +1129,70 @@ def get_interview(interview_id):
         except ValueError:
             return jsonify({'error': 'Invalid interview ID format'}), 400
 
-        # Load from database
+        # Fetch from database
         interview = supabase_client.get_interview_by_id(user_id, interview_id)
 
         if not interview:
-            return jsonify({'error': 'Interview not found'}), 404
+            # Try by room_name as fallback (for backward compatibility)
+            interview = supabase_client.get_interview_by_room_name(user_id, interview_id)
 
-        logger.info(f"[API] Loaded interview {interview_id} for user {user_id}")
+        if not interview:
+            logger.warning(f"[API] Interview not found: {interview_id}")
+            return jsonify({
+                'error': 'Interview not found',
+                'message': f'No interview found with ID: {interview_id}'
+            }), 404
 
-        # Format conversation for frontend
-        ordered_conversation = format_conversation(interview.get('conversation', {}))
+        # Get conversation data
+        conversation_dict = interview.get('conversation', {})
+        agent_msgs = conversation_dict.get('agent', [])
+        user_msgs = conversation_dict.get('user', [])
 
-        # Format for frontend
+        # Merge using postprocess for proper grouping
+        ordered_conversation = merge_by_agent_turns(agent_msgs, user_msgs)
+
+        # Calculate merged user turn count (for metadata)
+        merged_user_count = len([t for t in ordered_conversation if t.get('role') == 'candidate'])
+
+        # Extract stages covered from agent messages
+        stages_covered = list(set(
+            msg.get('stage') for msg in agent_msgs
+            if msg.get('stage')
+        ))
+
+        # Build metadata
+        meta = {
+            'candidate': interview.get('candidate_name', 'Unknown'),
+            'interview_date': interview.get('interview_date'),
+            'room_name': interview.get('room_name', ''),
+            'job_role': interview.get('job_role', ''),
+            'experience_level': interview.get('experience_level', ''),
+            'final_stage': interview.get('final_stage', ''),
+            'ended_by': interview.get('ended_by', 'unknown'),
+            'total_agent_messages': len(agent_msgs),
+            'total_user_messages': len(user_msgs),
+            'merged_user_turns': merged_user_count,
+            'total_turns': len(ordered_conversation),
+            'stages_covered': stages_covered,
+            'source': 'database'
+        }
+
+        logger.info(
+            f"[API] Retrieved interview {interview_id}: "
+            f"{len(ordered_conversation)} turns ({len(agent_msgs)} agent, {merged_user_count} candidate merged)"
+        )
+
         return jsonify({
-            'success': True,
-            'meta': {
-                'candidate': interview.get('candidate_name', 'Unknown'),
-                'interview_date': interview.get('interview_date'),
-                'job_role': interview.get('job_role'),
-                'experience_level': interview.get('experience_level'),
-                'source': 'database'
-            },
-            'ordered_conversation': ordered_conversation
+            'ordered_conversation': ordered_conversation,
+            'meta': meta
         })
 
     except Exception as e:
         logger.error(f"[API] Get interview error: {e}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'error': 'Failed to load interview',
+            'message': str(e)
+        }), 500
 
 
 @app.route('/api/interview/<filename>/summary')
@@ -1020,31 +1266,34 @@ def _load_interview_context(interview_id):
     Helper to load interview transcript and context for feedback generation from database.
 
     Returns:
-        tuple: (interview_chat, candidate_profile, job_summary, meta, conversation, error)
+        tuple: (interview_chat, candidate_profile, job_summary, meta, conversation, raw_conversation, error)
     """
     try:
         # Get authenticated user
         user_id = get_user_id()
         if not user_id:
-            return None, None, None, None, None, 'Authentication required'
+            return None, None, None, None, None, None, 'Authentication required'
 
         # Validate UUID format
         import uuid
         try:
             uuid.UUID(interview_id)
         except ValueError:
-            return None, None, None, None, None, f'Invalid interview ID format: {interview_id}'
+            return None, None, None, None, None, None, f'Invalid interview ID format: {interview_id}'
 
         # Load interview from database
         interview = supabase_client.get_interview_by_id(user_id, interview_id)
         if not interview:
-            return None, None, None, None, None, f'Could not find interview: {interview_id}'
+            return None, None, None, None, None, None, f'Could not find interview: {interview_id}'
 
-        # Format conversation from database format
-        conversation = format_conversation(interview.get('conversation', {}))
+        # Store raw conversation dict for speech analytics (before merging)
+        raw_conversation = interview.get('conversation', {})
+
+        # Format conversation from database format with proper merging
+        conversation = format_conversation_with_merge(raw_conversation)
 
         if not conversation:
-            return None, None, None, None, None, 'No conversation found in this interview'
+            return None, None, None, None, None, None, 'No conversation found in this interview'
 
         # Format transcript for LLM
         transcript_lines = []
@@ -1055,12 +1304,13 @@ def _load_interview_context(interview_id):
 
         interview_chat = "\n\n".join(transcript_lines)
 
-        # Build metadata
+        # Build metadata (include track info)
         meta = {
             'candidate': interview.get('candidate_name', 'Unknown'),
             'interview_date': interview.get('interview_date'),
             'job_role': interview.get('job_role'),
             'experience_level': interview.get('experience_level'),
+            'track': interview.get('track', 'intro'),
             'source': 'database'
         }
 
@@ -1072,11 +1322,11 @@ def _load_interview_context(interview_id):
         job_summary = f"Role: {meta.get('job_role', 'Not specified')}"
 
         logger.info(f"[FEEDBACK] Loaded interview context for {interview_id} from database")
-        return interview_chat, candidate_profile, job_summary, meta, conversation, None
+        return interview_chat, candidate_profile, job_summary, meta, conversation, raw_conversation, None
 
     except Exception as e:
         logger.error(f"[FEEDBACK] Error loading interview context: {e}", exc_info=True)
-        return None, None, None, None, None, f'Error loading interview: {str(e)}'
+        return None, None, None, None, None, None, f'Error loading interview: {str(e)}'
 
 
 @app.route('/api/feedback/scores', methods=['POST'])
@@ -1109,13 +1359,31 @@ def generate_feedback_scores():
             }), 400
             
         logger.info(f"[API] Feedback scores requested for: {interview_id}")
-        
+
         # Load interview context
-        interview_chat, candidate_profile, job_summary, meta, conversation, error = _load_interview_context(interview_id)
-        
+        interview_chat, candidate_profile, job_summary, meta, conversation, raw_conversation, error = _load_interview_context(interview_id)
+
         if error:
             return jsonify({'error': 'Interview not found', 'message': error}), 404
-        
+
+        # Run speech analytics on user conversation
+        from speech_analytics import analyze_transcript
+        try:
+            speech_data = analyze_transcript(raw_conversation if isinstance(raw_conversation, dict) else {})
+        except Exception as e:
+            logger.warning(f"[API] Speech analytics failed: {e}")
+            speech_data = {}
+
+        # Fetch coding submissions if this is a coding track interview
+        coding_submissions = []
+        interview_track = meta.get('track', 'intro')
+        if interview_track == 'coding' and interview_id:
+            try:
+                coding_submissions = supabase_client.get_coding_submissions(interview_id)
+                logger.info(f"[API] Fetched {len(coding_submissions)} coding submissions for feedback")
+            except Exception as e:
+                logger.warning(f"[API] Failed to fetch coding submissions: {e}")
+
         # Build scores extraction prompt
         user_prompt = FEEDBACKSCORES.user_template.format(
             candidate_profile=candidate_profile,
@@ -1123,11 +1391,11 @@ def generate_feedback_scores():
             interview_chat=interview_chat
         )
 
-        # Get authenticated user's OpenAI key from database (BYOK model)
+        # OpenAI key: user's BYOK, or the owner key for free-tier interviews.
         user_id = get_user_id()
-        keys = supabase_client.get_api_keys(user_id)
+        openai_key = resolve_openai_key(user_id)
 
-        if not keys or not keys.get('openai_key'):
+        if not openai_key:
             return jsonify({
                 'error': 'API key not configured',
                 'message': 'Please configure your OpenAI API key in Settings'
@@ -1135,7 +1403,7 @@ def generate_feedback_scores():
 
         logger.info(f"[API] Extracting scores via OpenAI for {interview_id}")
 
-        client = OpenAI(api_key=keys['openai_key'])
+        client = OpenAI(api_key=openai_key)
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1178,11 +1446,13 @@ def generate_feedback_scores():
             }
         
         logger.info(f"[API] Scores extracted successfully for {interview_id}")
-        
+
         return jsonify({
             'success': True,
             'interview_id': interview_id,
             'scores': scores_data,
+            'speech_analytics': speech_data,
+            'coding_submissions': coding_submissions,
             'meta': {
                 'candidate': meta.get('candidate'),
                 'interview_date': meta.get('interview_date'),
@@ -1230,16 +1500,39 @@ def generate_feedback():
             }), 400
             
         logger.info(f"[API] Feedback requested for: {interview_id}")
-        
+
         # Load interview context
-        interview_chat, candidate_profile, job_summary, meta, conversation, error = _load_interview_context(interview_id)
-        
+        interview_chat, candidate_profile, job_summary, meta, conversation, raw_conversation, error = _load_interview_context(interview_id)
+
         if error:
             return jsonify({'error': 'Interview not found', 'message': error}), 404
-        
+
+        # Get track info from meta
+        track_type = meta.get('track', 'intro')
+
+        # Run speech analytics
+        from speech_analytics import analyze_transcript
+        try:
+            speech_data = analyze_transcript(raw_conversation if isinstance(raw_conversation, dict) else {})
+        except Exception as e:
+            logger.warning(f"[API] Speech analytics failed: {e}")
+            speech_data = {}
+
+        # Fetch coding submissions if this is a coding track interview
+        coding_submissions = []
+        if track_type == 'coding' and interview_id:
+            try:
+                coding_submissions = supabase_client.get_coding_submissions(interview_id)
+                logger.info(f"[API] Fetched {len(coding_submissions)} coding submissions for feedback")
+            except Exception as e:
+                logger.warning(f"[API] Failed to fetch coding submissions: {e}")
+
+        import json as _json
+        speech_json = _json.dumps(speech_data, indent=2)
+
         # Build the feedback prompt using chain-of-thought approach
         system_prompt = build_post_interview_feedback_prompt()
-        
+
         user_prompt = f"""Please analyze this mock interview and provide detailed feedback.
 
 <CANDIDATE_PROFILE>
@@ -1250,17 +1543,34 @@ def generate_feedback():
 {job_summary}
 </JOB_SUMMARY>
 
+<INTERVIEW_TRACK>
+{track_type}
+</INTERVIEW_TRACK>
+
+<SPEECH_ANALYTICS>
+{speech_json}
+</SPEECH_ANALYTICS>
+
 <INTERVIEW_CHAT>
 {interview_chat}
 </INTERVIEW_CHAT>
 
-Provide your analysis and feedback following the output format specified."""
+Provide your analysis and feedback following the output format specified.
+Include a brief "Speech Analytics" section mentioning filler word count ({speech_data.get('filler_total', 'N/A')}) and average pace ({speech_data.get('avg_words_per_minute', 'N/A')} WPM) if available."""
 
-        # Get authenticated user's OpenAI key from database (BYOK model)
+        # Add coding context if available
+        coding_context = ""
+        if coding_submissions:
+            import json as _json2
+            coding_context = f"\n\n<CODING_SUBMISSIONS>\n{_json2.dumps(coding_submissions, indent=2)[:3000]}\n</CODING_SUBMISSIONS>"
+
+        user_prompt = user_prompt.rstrip() + coding_context
+
+        # OpenAI key: user's BYOK, or the owner key for free-tier interviews.
         user_id = get_user_id()
-        keys = supabase_client.get_api_keys(user_id)
+        openai_key = resolve_openai_key(user_id)
 
-        if not keys or not keys.get('openai_key'):
+        if not openai_key:
             return jsonify({
                 'error': 'API key not configured',
                 'message': 'Please configure your OpenAI API key in Settings'
@@ -1268,7 +1578,7 @@ Provide your analysis and feedback following the output format specified."""
 
         logger.info(f"[API] Generating feedback via OpenAI for {interview_id}")
 
-        client = OpenAI(api_key=keys['openai_key'])
+        client = OpenAI(api_key=openai_key)
         
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1291,11 +1601,13 @@ Provide your analysis and feedback following the output format specified."""
         }
         
         logger.info(f"[API] Feedback generated and cached for {interview_id}")
-        
+
         response_data = {
             'success': True,
             'interview_id': interview_id,
             'feedback': feedback_text,
+            'speech_analytics': speech_data,
+            'coding_submissions_count': len(coding_submissions),
             'meta': {
                 'candidate': meta.get('candidate'),
                 'interview_date': meta.get('interview_date'),
@@ -1303,11 +1615,11 @@ Provide your analysis and feedback following the output format specified."""
                 'model': 'gpt-4o-mini'
             }
         }
-        
+
         # Include scores if provided
         if provided_scores:
             response_data['scores'] = provided_scores
-        
+
         return jsonify(response_data)
         
     except Exception as e:
@@ -1387,36 +1699,24 @@ def skip_stage():
 
 @app.route('/health')
 def health_check():
-    """Health check endpoint for monitoring and deployment verification."""
-    try:
-        # Verify Supabase environment credentials are set
-        supabase_url = os.getenv('SUPABASE_URL')
-        supabase_key = os.getenv('SUPABASE_SERVICE_KEY')
+    """Health check: verify the Neon database is reachable, report worker load."""
+    db_ok = supabase_client.ping()
+    active_worker_count = len(worker_manager.active_workers)
+    max_workers = worker_manager.max_workers
 
-        if not supabase_url or not supabase_key:
-            raise ValueError("Supabase credentials not configured")
-
-        # Count active workers
-        active_worker_count = len(worker_manager.active_workers)
-        max_workers = worker_manager.max_workers
-
-        logger.info(f"[HEALTH] Health check passed - {active_worker_count}/{max_workers} workers active")
-
-        return jsonify({
-            'status': 'healthy',
-            'database': 'configured',
-            'workers': {
-                'active': active_worker_count,
-                'max': max_workers
-            }
-        }), 200
-
-    except Exception as e:
-        logger.error(f"[HEALTH] Health check failed: {e}", exc_info=True)
+    if not db_ok:
+        logger.error("[HEALTH] Database ping failed")
         return jsonify({
             'status': 'unhealthy',
-            'error': str(e)
-        }), 500
+            'database': 'unreachable',
+            'workers': {'active': active_worker_count, 'max': max_workers},
+        }), 503
+
+    return jsonify({
+        'status': 'healthy',
+        'database': 'reachable',
+        'workers': {'active': active_worker_count, 'max': max_workers},
+    }), 200
 
 
 

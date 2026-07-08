@@ -1,3 +1,6 @@
+# Git worktrees
+.worktrees/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -190,3 +193,10 @@ PITCH_SCRIPTS.md
 *.env.local
 supabase/.env
 /interviews
+/feedback
+
+# Local scheduler lock
+.claude/scheduled_tasks.lock
+
+# Git worktrees
+.worktrees/
