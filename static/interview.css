@@ -251,3 +251,197 @@
     padding: 0.625rem 1.25rem;
     font-size: 0.875rem;
 }
+
+/* ============================================================
+   Coding Track - Split Layout & Monaco Editor
+   ============================================================ */
+
+/* 3-column layout for coding track */
+.interview-main.coding-mode {
+    grid-template-columns: 1fr 2fr 1fr;
+    gap: 1rem;
+    align-items: start;
+}
+
+/* Code editor panel */
+.code-editor-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    height: 100%;
+    min-height: 400px;
+    background: var(--bg-card);
+    border-radius: var(--radius-md);
+    padding: 1rem;
+    box-shadow: var(--shadow-soft);
+    overflow: hidden;
+}
+
+/* Problem statement */
+.problem-display {
+    overflow-y: auto;
+    max-height: 180px;
+    border-bottom: 1px solid var(--bg-soft);
+    padding-bottom: 0.5rem;
+}
+
+.problem-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.problem-title {
+    font-weight: 600;
+    font-size: 0.9375rem;
+    color: var(--text-primary);
+}
+
+.problem-difficulty {
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.125rem 0.5rem;
+    border-radius: var(--radius-full);
+    background: var(--bg-soft);
+    color: var(--text-muted);
+}
+
+.problem-description,
+.problem-examples,
+.problem-constraints {
+    font-size: 0.8125rem;
+    line-height: 1.6;
+    color: var(--text-secondary);
+    margin-top: 0.375rem;
+}
+
+.problem-examples pre,
+.problem-constraints pre {
+    background: var(--bg-soft);
+    padding: 0.5rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.75rem;
+    overflow-x: auto;
+}
+
+/* Editor toolbar */
+.editor-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+/* Per-problem countdown timer */
+.problem-timer {
+    font-size: 1.125rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+    letter-spacing: 0.05em;
+}
+
+.problem-timer.warning {
+    color: var(--warning);
+}
+
+.problem-timer.critical {
+    color: var(--error);
+}
+
+/* Attempt counter */
+.attempt-counter {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+    margin-left: auto;
+}
+
+/* Submit / Skip buttons */
+.editor-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.25rem;
+}
+
+/* Evaluation result overlay */
+.evaluation-overlay {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--bg-card);
+    border-top: 2px solid var(--bg-soft);
+    padding: 0.75rem 1rem;
+    font-size: 0.8125rem;
+    animation: slideUp 0.2s ease;
+}
+
+@keyframes slideUp {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+}
+
+/* Responsive: stack on smaller screens */
+@media (max-width: 1200px) {
+    .interview-main.coding-mode {
+        grid-template-columns: 1fr 1.5fr;
+    }
+    .candidate-side {
+        display: none;
+    }
+}
+
+@media (max-width: 900px) {
+    .interview-main.coding-mode {
+        grid-template-columns: 1fr;
+    }
+    .code-editor-panel {
+        min-height: 300px;
+    }
+}
+
+.skip-intro-area {
+    position: fixed;
+    top: 75px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 50;
+    text-align: center;
+}
+
+/* === LeetCode-style problem display === */
+.problem-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+.problem-title { font-size: 0.95rem; font-weight: 700; color: var(--text-primary, #1a1a1a); }
+.problem-difficulty { font-size: 0.7rem; font-weight: 700; padding: 2px 8px; border-radius: 10px; text-transform: capitalize; flex-shrink: 0; }
+.diff-easy { background: rgba(34,197,94,0.15); color: #16a34a; }
+.diff-medium { background: rgba(245,158,11,0.15); color: #d97706; }
+.diff-hard { background: rgba(239,68,68,0.15); color: #dc2626; }
+.problem-description { font-size: 0.85rem; color: var(--text-primary, #1a1a1a); line-height: 1.7; margin-bottom: 12px; white-space: pre-wrap; word-break: break-word; }
+.problem-section-label { font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted, #888); margin: 10px 0 5px; }
+.problem-example { margin-bottom: 8px; }
+.example-label { font-size: 0.73rem; font-weight: 600; color: var(--text-muted, #888); margin-bottom: 3px; }
+.example-code { font-family: 'Courier New', monospace; font-size: 0.78rem; background: var(--bg-soft, #f5f5f5); padding: 8px 10px; border-radius: 4px; margin: 0; white-space: pre; overflow-x: auto; line-height: 1.6; }
+.problem-constraints { font-size: 0.8rem; color: var(--text-muted, #888); padding-left: 18px; margin: 0; line-height: 1.9; }
+/* === Evaluation feedback state === */
+#submitCodeBtn.evaluating {
+    opacity: 0.6;
+    cursor: not-allowed;
+    background: var(--bg-soft, #eee);
+    color: var(--text-muted, #888);
+    border-color: var(--bg-soft, #eee);
+}
+
+.eval-spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--bg-soft, #ddd);
+    border-top-color: var(--accent-green-deep, #16a34a);
+    border-radius: 50%;
+    animation: eval-spin 0.7s linear infinite;
+    flex-shrink: 0;
+}
+
+@keyframes eval-spin {
+    to { transform: rotate(360deg); }
+}

@@ -22,31 +22,9 @@
                     <div class="progress-line">
                         <div class="progress-fill" id="progressFill"></div>
                     </div>
-                    
-                    <div class="stage-dot active" data-stage="welcome" id="stageWelcome">
-                        <div class="stage-circle">1</div>
-                        <span class="stage-label">Welcome</span>
-                    </div>
-                    
-                    <div class="stage-dot" data-stage="self_intro" id="stageSelfIntro">
-                        <div class="stage-circle">2</div>
-                        <span class="stage-label">Introduction</span>
-                    </div>
-                    
-                    <div class="stage-dot" data-stage="past_experience" id="stagePastExp">
-                        <div class="stage-circle">3</div>
-                        <span class="stage-label">Experience</span>
-                    </div>
-                    
-                    <div class="stage-dot" data-stage="company_fit" id="stageCompanyFit">
-                        <div class="stage-circle">4</div>
-                        <span class="stage-label">Company Fit</span>
-                    </div>
-                    
-                    <div class="stage-dot" data-stage="closing" id="stageClosing">
-                        <div class="stage-circle">5</div>
-                        <span class="stage-label">Closing</span>
-                    </div>
+
+                    <!-- Stage dots populated dynamically by JS based on track -->
+                    <div id="stageDots"></div>
                 </div>
             </div>
         </header>
@@ -60,6 +38,14 @@
         </div>
         
         <div class="stage-timer-display" id="stageTimer">0:00</div>
+
+        <!-- Skip Intro button: visible only during greeting/self_intro stages -->
+        <div class="skip-intro-area" id="skipIntroArea" style="display:none;text-align:center;margin-bottom:0.5rem;">
+            <button id="skipIntroBtn" style="background:transparent;border:1.5px solid var(--text-muted);color:var(--text-muted);padding:0.375rem 1rem;border-radius:var(--radius-full);font-size:0.8125rem;cursor:pointer;">
+                Skip Intro
+            </button>
+        </div>
+
         <div class="skip-area">
             <button id="skipToggle" class="skip-toggle" aria-expanded="false">Skip stages ▾</button>
             <div class="skip-row hidden" id="skipRow">
@@ -112,7 +98,44 @@
                     <p class="caption-text empty" id="agentCaption">Waiting for agent...</p>
                 </div>
             </div>
-            
+
+            <!-- Code editor panel: visible only for coding track -->
+            <div class="code-editor-panel" id="codeEditorPanel" style="display:none;">
+                <div id="codingReadyPanel" style="display:none; text-align:center; padding:3rem 2rem; border-bottom:1px solid var(--bg-soft,#eee);">
+                    <p style="color:var(--text-muted,#888); margin-bottom:1.5rem; font-size:0.9rem;">Your coding interview is ready. Click below when you want to begin.</p>
+                    <button id="readyForProblemBtn" class="btn-primary" style="padding:0.75rem 2rem; font-size:1rem; font-weight:600; border-radius:8px; cursor:pointer;">I'm Ready</button>
+                </div>
+                <div class="problem-display" id="problemDisplay">
+                    <div class="problem-header">
+                        <span id="problemTitle" class="problem-title">Waiting for problem...</span>
+                        <span id="problemDifficulty" class="problem-difficulty"></span>
+                    </div>
+                    <div id="problemDescription" class="problem-description"></div>
+                    <div id="problemExamples" class="problem-examples"></div>
+                    <div id="problemConstraints" class="problem-constraints"></div>
+                </div>
+                <div class="editor-toolbar">
+                    <select id="languageSelect" style="padding:0.375rem 0.5rem;border:1.5px solid var(--bg-soft);border-radius:var(--radius-sm);font-size:0.8125rem;background:var(--bg-card);">
+                        <option value="python">Python</option>
+                        <option value="javascript">JavaScript</option>
+                        <option value="java">Java</option>
+                        <option value="cpp">C++</option>
+                        <option value="go">Go</option>
+                    </select>
+                    <div id="problemTimer" class="problem-timer" style="display:none;">15:00</div>
+                    <span id="attemptCounter" class="attempt-counter" style="display:none;">Attempt 1/3</span>
+                </div>
+                <div id="monacoEditorContainer" style="width:100%;height:300px;border:1.5px solid var(--bg-soft);border-radius:var(--radius-sm);overflow:hidden;"></div>
+                <div class="editor-actions">
+                    <button id="submitCodeBtn" class="btn-primary" style="padding:0.5rem 1.25rem;font-size:0.875rem;">Submit</button>
+                    <button id="skipProblemBtn" class="btn-secondary" style="padding:0.5rem 1rem;font-size:0.875rem;">Skip Problem</button>
+                </div>
+                <div id="evalStatusStrip" style="display:none;align-items:center;gap:10px;padding:10px 14px;margin-top:8px;border-radius:var(--radius-sm);background:var(--bg-soft);border:1px solid var(--bg-soft);">
+                    <span class="eval-spinner"></span>
+                    <span style="font-size:0.8125rem;color:var(--text-muted);">Evaluating your solution — agent will respond shortly...</span>
+                </div>
+            </div>
+
             <div class="candidate-side">
                 <span class="candidate-label">Candidate</span>
                 <div class="candidate-card">
@@ -218,6 +241,14 @@
         window.addEventListener('load', initInterview);
 
         function initInterview() {
+            // Guard: must arrive from form page with a valid session token.
+            // If missing, the user navigated here directly (back button, bookmark, etc.) — redirect away.
+            if (!sessionStorage.getItem('mockflow_token') || !sessionStorage.getItem('mockflow_room')) {
+                console.warn('[GUARD] No session token — redirecting to /start');
+                window.location.replace('/start');
+                return;
+            }
+
             var LK = null;
             var LIVEKIT_CDN = 'https://cdn.jsdelivr.net/npm/livekit-client@2.5.0/dist/livekit-client.umd.min.js';
             var statusEl = document.getElementById('statusText');
@@ -345,6 +376,7 @@
             }
             
             var params = new URLSearchParams(window.location.search);
+            var trackParam = params.get('track') || 'intro';
             var candidate = {
                 name: params.get('name') || 'Candidate',
                 email: params.get('email') || '',
@@ -357,9 +389,9 @@
             document.getElementById('candidateName').textContent = candidate.name;
             document.getElementById('candidateRole').textContent = candidate.role;
             document.getElementById('candidateLevel').textContent = formatLevel(candidate.level);
-            
+
             var state = {
-                currentStage: 'welcome',
+                currentStage: (trackParam === 'intro' ? 'welcome' : 'greeting'),
                 isMuted: false,
                 isConnected: false,
                 isVideoOn: true,
@@ -395,11 +427,63 @@
                 modalConfirm: document.getElementById('modalConfirm'),
                 videoContainer: document.getElementById('videoContainer'),
                 candidateVideo: document.getElementById('candidateVideo'),
-                videoToggle: document.getElementById('videoToggle')
+                videoToggle: document.getElementById('videoToggle'),
+                agentVisualizer: document.getElementById('agentVisualizer')
             };
             
-            var stages = ['welcome', 'self_intro', 'past_experience', 'company_fit', 'closing'];
-            var stageProgress = { welcome: 0, self_intro: 20, past_experience: 40, company_fit: 60, closing: 100 };
+            // Track-specific stage definitions
+            var TRACK_STAGES = {
+                intro: [
+                    { key: 'welcome', label: 'Welcome' },
+                    { key: 'self_intro', label: 'Introduction' },
+                    { key: 'past_experience', label: 'Experience' },
+                    { key: 'company_fit', label: 'Company Fit' },
+                    { key: 'closing', label: 'Closing' }
+                ],
+                behavioral: [
+                    { key: 'greeting', label: 'Welcome' },
+                    { key: 'self_intro', label: 'Introduction' },
+                    { key: 'behavioral_q1', label: 'Questions' },
+                    { key: 'closing', label: 'Closing' }
+                ],
+                technical_voice: [
+                    { key: 'greeting', label: 'Welcome' },
+                    { key: 'self_intro', label: 'Introduction' },
+                    { key: 'experience_discussion', label: 'Experience' },
+                    { key: 'technical_concepts_1', label: 'Concepts' },
+                    { key: 'closing', label: 'Closing' }
+                ],
+                coding: [
+                    { key: 'greeting', label: 'Welcome' },
+                    { key: 'warm_up', label: 'Warm Up' },
+                    { key: 'coding_problem_1', label: 'Problem 1' },
+                    { key: 'coding_problem_2', label: 'Problem 2' },
+                    { key: 'closing', label: 'Closing' }
+                ]
+            };
+
+            var trackStageList = TRACK_STAGES[trackParam] || TRACK_STAGES.intro;
+            var stages = trackStageList.map(function(s) { return s.key; });
+            var stageProgress = {};
+            trackStageList.forEach(function(s, i) {
+                stageProgress[s.key] = Math.round((i / (trackStageList.length - 1)) * 100);
+            });
+            // Variant stages map to parent dot position
+            ['behavioral_q2', 'behavioral_q3'].forEach(function(k) { stageProgress[k] = stageProgress['behavioral_q1'] || 50; });
+            // coding_problem_2 fallback when only 1-problem session
+            stageProgress['self_intro'] = stageProgress['self_intro'] !== undefined ? stageProgress['self_intro'] : stageProgress['warm_up'] || 25;
+            ['technical_concepts_2', 'technical_concepts_3'].forEach(function(k) { stageProgress[k] = stageProgress['technical_concepts_1'] || 60; });
+
+            // Render stage dots
+            var stageDots = document.getElementById('stageDots');
+            if (stageDots) {
+                stageDots.innerHTML = trackStageList.map(function(s, i) {
+                    return '<div class="stage-dot' + (i === 0 ? ' active' : '') + '" data-stage="' + s.key + '">' +
+                        '<div class="stage-circle">' + (i + 1) + '</div>' +
+                        '<span class="stage-label">' + s.label + '</span>' +
+                        '</div>';
+                }).join('');
+            }
             
             var AGENT_BAR_COUNT = 64;
             var agentBars = [];
@@ -416,6 +500,23 @@
             initCandidateSpikes();
             initVideoFeed();
             initSkipControls();
+            initSkipIntro();
+
+            if (trackParam === 'coding') {
+                document.querySelector('.interview-main').classList.add('coding-mode');
+                document.getElementById('codeEditorPanel').style.display = 'flex';
+                loadMonacoScript();
+                initCodeSubmit();
+                // Hide skip controls for coding track
+                var skipArea = document.querySelector('.skip-area');
+                var skipIntroArea = document.getElementById('skipIntroArea');
+                if (skipArea) skipArea.style.display = 'none';
+                if (skipIntroArea) skipIntroArea.style.display = 'none';
+                // Hide editor — ready panel shown only AFTER agent joins (see onParticipantConnected)
+                var monacoContainer = document.getElementById('monacoEditorContainer');
+                if (monacoContainer) monacoContainer.style.display = 'none';
+            }
+
             startTimer();
             startBlinkAnimation();
             startDemoAnimations();
@@ -459,10 +560,19 @@
 
                 elements.progressFill.style.width = stageProgress[newStage] + '%';
 
+                // Map variant stages to their representative stage for dot highlighting
+                var stageAlias = {
+                    'behavioral_q2': 'behavioral_q1',
+                    'behavioral_q3': 'behavioral_q1',
+                    'technical_concepts_2': 'technical_concepts_1',
+                    'technical_concepts_3': 'technical_concepts_1'
+                };
+                var resolvedStage = stageAlias[newStage] || newStage;
+                var currentIndex = stages.indexOf(resolvedStage);
+
                 stages.forEach(function(stage, index) {
                     var dot = document.querySelector('[data-stage="' + stage + '"]');
-                    var currentIndex = stages.indexOf(newStage);
-
+                    if (!dot) return;
                     dot.classList.remove('active', 'completed');
                     if (index < currentIndex) {
                         dot.classList.add('completed');
@@ -470,6 +580,13 @@
                         dot.classList.add('active');
                     }
                 });
+
+                // Show/hide skip intro button based on stage
+                var skipIntroArea = document.getElementById('skipIntroArea');
+                if (skipIntroArea) {
+                    var introStages = ['greeting', 'welcome', 'self_intro'];
+                    skipIntroArea.style.display = introStages.includes(newStage) ? 'block' : 'none';
+                }
 
                 updateSkipButtons(newStage);
                 console.log('[STAGE] Transition to:', newStage);
@@ -508,16 +625,298 @@
                 }
             }
             
+            function initSkipIntro() {
+                var btn = document.getElementById('skipIntroBtn');
+                if (!btn) return;
+                btn.addEventListener('click', function() {
+                    if (!state.room) return;
+                    try {
+                        var payload = JSON.stringify({ type: 'skip_intro' });
+                        state.room.localParticipant.publishData(
+                            new TextEncoder().encode(payload),
+                            { reliable: true }
+                        );
+                        console.log('[SKIP] Sent skip_intro signal');
+                        document.getElementById('skipIntroArea').style.display = 'none';
+                    } catch(e) {
+                        console.error('[SKIP] Failed to send skip_intro:', e);
+                    }
+                });
+            }
+
+            // ================ MONACO EDITOR ================
+            var monacoEditor = null;
+            var problemTimerInterval = null;
+            var currentProblemIndex = 0;
+            var currentAttempt = 1;
+            var maxAttempts = 3;
+
+            function loadMonacoScript() {
+                if (typeof require !== 'undefined') {
+                    initMonacoEditor();
+                    return;
+                }
+                var script = document.createElement('script');
+                script.src = 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs/loader.min.js';
+                script.onload = function() { initMonacoEditor(); };
+                script.onerror = function() { console.warn('[MONACO] Failed to load from CDN'); };
+                document.head.appendChild(script);
+            }
+
+            function initMonacoEditor() {
+                if (typeof require === 'undefined') {
+                    loadMonacoScript();
+                    return;
+                }
+                require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.45.0/min/vs' } });
+                require(['vs/editor/editor.main'], function() {
+                    monacoEditor = monaco.editor.create(document.getElementById('monacoEditorContainer'), {
+                        value: '# Write your solution here\n',
+                        language: 'python',
+                        theme: 'vs',
+                        minimap: { enabled: false },
+                        fontSize: 13,
+                        lineNumbers: 'on',
+                        scrollBeyondLastLine: false,
+                        automaticLayout: true,
+                        wordWrap: 'on',
+                    });
+
+                    var preferredLang = new URLSearchParams(window.location.search).get('preferredLanguage') || 'python';
+                    if (preferredLang !== 'python') {
+                        monaco.editor.setModelLanguage(monacoEditor.getModel(), preferredLang);
+                        var langSelect = document.getElementById('languageSelect');
+                        if (langSelect) langSelect.value = preferredLang;
+                    }
+
+                    var langSelect = document.getElementById('languageSelect');
+                    if (langSelect) {
+                        langSelect.addEventListener('change', function() {
+                            if (monacoEditor) {
+                                monaco.editor.setModelLanguage(monacoEditor.getModel(), this.value);
+                            }
+                        });
+                    }
+
+                    // Disable copy, paste, cut
+                    monacoEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, function() { /* paste disabled */ });
+                    monacoEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyC, function() { /* copy disabled */ });
+                    monacoEditor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyX, function() { /* cut disabled */ });
+                    // Block browser paste events on the container
+                    var edContainer = document.getElementById('monacoEditorContainer');
+                    if (edContainer) {
+                        edContainer.addEventListener('paste', function(e) { e.preventDefault(); e.stopPropagation(); }, true);
+                        edContainer.addEventListener('contextmenu', function(e) { e.preventDefault(); }, true);
+                    }
+
+                    console.log('[MONACO] Editor ready');
+                });
+            }
+
+            function initCodeSubmit() {
+                var submitBtn = document.getElementById('submitCodeBtn');
+                var skipBtn = document.getElementById('skipProblemBtn');
+
+                if (submitBtn) {
+                    submitBtn.addEventListener('click', function() {
+                        handleCodeSubmit(false);
+                    });
+                }
+
+                if (skipBtn) {
+                    skipBtn.addEventListener('click', function() {
+                        if (!state.room) return;
+                        try {
+                            var payload = JSON.stringify({ type: 'skip_coding_problem' });
+                            state.room.localParticipant.publishData(new TextEncoder().encode(payload), { reliable: true });
+                            console.log('[CODE] Skip problem signal sent');
+                        } catch(e) {
+                            console.error('[CODE] Failed to send skip signal:', e);
+                        }
+                    });
+                }
+
+                var readyBtn = document.getElementById('readyForProblemBtn');
+                if (readyBtn) {
+                    readyBtn.addEventListener('click', function() {
+                        document.getElementById('codingReadyPanel').style.display = 'none';
+                        var mc = document.getElementById('monacoEditorContainer');
+                        if (mc) mc.style.display = 'block';
+
+                        if (!state.room || !state.room.localParticipant) {
+                            // Room not ready yet — set pending flag, will re-send when agent joins
+                            window._codingReadyPending = true;
+                            console.warn('[CODE] Room not connected, queued ready_for_problem');
+                            return;
+                        }
+                        var readyPayload = JSON.stringify({ type: 'ready_for_problem' });
+                        state.room.localParticipant.publishData(
+                            new TextEncoder().encode(readyPayload),
+                            { reliable: true }
+                        );
+                        console.log('[CODE] Ready for problem signal sent');
+                    });
+                }
+            }
+
+            function setSubmitEvaluating(on) {
+                var btn = document.getElementById('submitCodeBtn');
+                var strip = document.getElementById('evalStatusStrip');
+                if (on) {
+                    if (btn) { btn.disabled = true; btn.textContent = 'Evaluating...'; btn.classList.add('evaluating'); }
+                    if (strip) { strip.style.display = 'flex'; }
+                } else {
+                    if (btn) { btn.disabled = false; btn.textContent = 'Submit'; btn.classList.remove('evaluating'); }
+                    if (strip) { strip.style.display = 'none'; }
+                }
+            }
+
+            function handleCodeSubmit(isAutoSubmit) {
+                if (!state.room) return;
+                var code = monacoEditor ? monacoEditor.getValue() : '';
+                var language = document.getElementById('languageSelect') ? document.getElementById('languageSelect').value : 'python';
+
+                if (!code.trim() && !isAutoSubmit) {
+                    console.warn('[CODE] Empty code submission ignored');
+                    return;
+                }
+
+                setSubmitEvaluating(true);
+
+                try {
+                    var payload = JSON.stringify({
+                        type: 'code_submitted',
+                        code: code,
+                        language: language,
+                        problem_index: currentProblemIndex,
+                        attempt: currentAttempt,
+                        auto_submit: isAutoSubmit,
+                    });
+                    state.room.localParticipant.publishData(new TextEncoder().encode(payload), { reliable: true });
+                    console.log('[CODE] Submitted code, attempt', currentAttempt, '/', maxAttempts);
+                } catch(e) {
+                    console.error('[CODE] Failed to submit code:', e);
+                }
+            }
+
+            function escHtml(str) {
+                return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+            }
+
+            function displayProblem(problem) {
+                var panel = document.getElementById('problemDisplay');
+                if (!panel) return;
+
+                var html = '<div class="problem-header">';
+                html += '<span class="problem-title">' + escHtml(problem.title || 'Coding Problem') + '</span>';
+                if (problem.difficulty) {
+                    var diffClass = 'diff-' + (problem.difficulty || 'medium').toLowerCase();
+                    html += '<span class="problem-difficulty ' + diffClass + '">' + escHtml(problem.difficulty) + '</span>';
+                }
+                html += '</div>';
+
+                if (problem.description) {
+                    html += '<div class="problem-description">' + escHtml(problem.description) + '</div>';
+                }
+
+                if (problem.examples && problem.examples.length) {
+                    html += '<div class="problem-section-label">Examples</div>';
+                    problem.examples.slice(0, 2).forEach(function(ex, i) {
+                        html += '<div class="problem-example">';
+                        html += '<div class="example-label">Example ' + (i + 1) + '</div>';
+                        html += '<pre class="example-code">Input:  ' + escHtml(String(ex.input || '')) + '\nOutput: ' + escHtml(String(ex.output || ''));
+                        if (ex.explanation) html += '\n// ' + escHtml(ex.explanation);
+                        html += '</pre></div>';
+                    });
+                }
+
+                if (problem.constraints && problem.constraints.length) {
+                    html += '<div class="problem-section-label">Constraints</div>';
+                    html += '<ul class="problem-constraints">';
+                    problem.constraints.forEach(function(c) {
+                        html += '<li>' + escHtml(String(c)) + '</li>';
+                    });
+                    html += '</ul>';
+                }
+
+                panel.innerHTML = html;
+
+                // Show editor, hide ready panel
+                var readyPanel = document.getElementById('codingReadyPanel');
+                if (readyPanel) readyPanel.style.display = 'none';
+                var mc = document.getElementById('monacoEditorContainer');
+                if (mc) mc.style.display = 'block';
+
+                // Set starter code in editor
+                if (monacoEditor) {
+                    var starter = getStarterCode(monacoEditor.getModel().getLanguageId());
+                    monacoEditor.setValue(starter);
+                }
+
+                console.log('[CODE] Displayed problem:', problem.title);
+            }
+
+            function getStarterCode(language) {
+                var starters = {
+                    python: '# Solution\ndef solution():\n    pass\n',
+                    javascript: '// Solution\nfunction solution() {\n    \n}\n',
+                    java: '// Solution\nclass Solution {\n    public void solve() {\n        \n    }\n}\n',
+                    cpp: '// Solution\n#include <bits/stdc++.h>\nusing namespace std;\n\nvoid solution() {\n    \n}\n',
+                    go: '// Solution\npackage main\n\nfunc solution() {\n    \n}\n',
+                };
+                return starters[language] || starters.python;
+            }
+
+            function startProblemTimer(seconds) {
+                clearInterval(problemTimerInterval);
+                var remaining = seconds;
+                var timerEl = document.getElementById('problemTimer');
+                if (timerEl) timerEl.style.display = 'block';
+
+                function formatTime(s) {
+                    var m = Math.floor(s / 60);
+                    var sec = s % 60;
+                    return String(m).padStart(2, '0') + ':' + String(sec).padStart(2, '0');
+                }
+
+                function tick() {
+                    if (timerEl) {
+                        timerEl.textContent = formatTime(remaining);
+                        if (remaining <= 60) timerEl.className = 'problem-timer critical';
+                        else if (remaining <= 180) timerEl.className = 'problem-timer warning';
+                        else timerEl.className = 'problem-timer';
+                    }
+                    if (remaining <= 0) {
+                        clearInterval(problemTimerInterval);
+                        console.log('[TIMER] Problem time expired, auto-submitting');
+                        handleCodeSubmit(true);
+                    }
+                    remaining--;
+                }
+                tick();
+                problemTimerInterval = setInterval(tick, 1000);
+            }
+
+            function updateAttemptCounter(attempt, max) {
+                currentAttempt = attempt;
+                maxAttempts = max;
+                var el = document.getElementById('attemptCounter');
+                if (el) {
+                    el.textContent = 'Attempt ' + attempt + '/' + max;
+                    el.style.display = 'inline';
+                }
+            }
+
             function updateSkipButtons(currentStage) {
                 var skipBtns = document.querySelectorAll('.skip-btn');
                 var currentIndex = stages.indexOf(currentStage);
-                
+
                 skipBtns.forEach(function(btn) {
                     var target = btn.getAttribute('data-target');
                     var targetIndex = stages.indexOf(target);
-                    
+
                     btn.classList.remove('current', 'completed');
-                    
+
                     if (targetIndex < currentIndex) {
                         btn.classList.add('completed');
                         btn.disabled = true;
@@ -869,6 +1268,12 @@
                 state.isConnected = true;
                 updateStatus('Connected', 'connected');
 
+                // Show skip intro button on connection (non-coding tracks only)
+                if (trackParam !== 'coding') {
+                    var skipIntroArea = document.getElementById('skipIntroArea');
+                    if (skipIntroArea) { skipIntroArea.style.display = 'block'; }
+                }
+
                 try {
                     await state.room.localParticipant.setMicrophoneEnabled(true);
                     console.log('[ROOM] Microphone enabled');
@@ -889,6 +1294,16 @@
                     }
 
                     updateCandidateCaption('Waiting for agent to join...');
+
+                    // Agent may already be in the room (pre-spawned) — check existing participants
+                    if (trackParam === 'coding') {
+                        state.room.remoteParticipants.forEach(function(p) {
+                            if (p.identity === 'interview-agent' || p.identity.includes('agent')) {
+                                console.log('[PARTICIPANT] Agent already in room:', p.identity);
+                                onParticipantConnected(p);
+                            }
+                        });
+                    }
 
                 } catch (err) {
                     console.error('[ROOM] Microphone error:', err);
@@ -1090,16 +1505,35 @@
             }
 
             function setAgentSpeaking(speaking) {
+                var viz = (elements && elements.agentVisualizer) || document.getElementById('agentVisualizer');
+                if (!viz) return;
                 if (speaking) {
-                    elements.agentVisualizer.classList.add('speaking');
+                    viz.classList.add('speaking');
                 } else {
-                    elements.agentVisualizer.classList.remove('speaking');
+                    viz.classList.remove('speaking');
                 }
             }
             
             function onDataReceived(payload, participant) {
                 try {
                     var data = JSON.parse(new TextDecoder().decode(payload));
+
+                    if (data.type === 'coding_problem' && data.problem) {
+                        currentProblemIndex = data.problem_index || 0;
+                        displayProblem(data.problem);
+                        startProblemTimer((data.time_limit_minutes || 15) * 60);
+                        updateAttemptCounter(data.attempt_number || 1, data.max_attempts || 3);
+                        console.log('[CODE] Received problem:', data.problem.title);
+                    }
+                    if (data.type === 'evaluation_result') {
+                        updateAttemptCounter(data.attempt || 1, data.max_attempts || 3);
+                        setSubmitEvaluating(false);
+                        console.log('[CODE] Evaluation received:', data.evaluation);
+                    }
+                    if (data.type === 'max_attempts_reached') {
+                        clearInterval(problemTimerInterval);
+                        console.log('[CODE] Max attempts reached for problem', data.problem_index);
+                    }
 
                     if (data.type === 'stage_change' && data.stage) {
                         updateStage(data.stage);
@@ -1140,6 +1574,32 @@
             
             function onParticipantConnected(participant) {
                 console.log('[PARTICIPANT] Connected:', participant.identity);
+                var isAgent = participant.identity === 'interview-agent' || participant.identity.includes('agent');
+                if (!isAgent) return;
+
+                // Update agent caption
+                if (elements.agentCaption) {
+                    elements.agentCaption.textContent = 'Agent connected. Interview starting...';
+                    elements.agentCaption.classList.remove('empty');
+                }
+
+                // For coding track: show ready panel now that agent is in the room
+                if (trackParam === 'coding') {
+                    document.getElementById('codingReadyPanel').style.display = 'block';
+                    // If user clicked Ready before agent joined, re-send after 1.5s delay
+                    if (window._codingReadyPending) {
+                        window._codingReadyPending = false;
+                        setTimeout(function() {
+                            if (state.room && state.room.localParticipant) {
+                                var rp = JSON.stringify({ type: 'ready_for_problem' });
+                                state.room.localParticipant.publishData(
+                                    new TextEncoder().encode(rp), { reliable: true }
+                                );
+                                console.log('[CODE] Auto-resent ready_for_problem after agent joined');
+                            }
+                        }, 1500);
+                    }
+                }
             }
         }
     })();
