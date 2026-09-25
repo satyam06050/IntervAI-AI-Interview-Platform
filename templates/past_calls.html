@@ -3,7 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Past Interviews - MockFlow-AI</title>
+    <title>Past Interviews — MockFlow-AI</title>
+    <meta name="description" content="Review your previous MockFlow-AI mock interviews, revisit the feedback for each session, and track how your practice is improving over time.">
+    <meta property="og:title" content="Past Interviews — MockFlow-AI">
+    <meta property="og:description" content="Review your previous MockFlow-AI mock interviews, revisit the feedback for each session, and track how your practice is improving over time.">
+    <meta property="og:type" content="website">
     <link rel="icon" type="image/x-icon" href="/favicon.ico">
     <link rel="shortcut icon" type="image/x-icon" href="/favicon.ico">
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -12,7 +16,6 @@
     <link rel="stylesheet" href="/static/styles.css">
     <link rel="stylesheet" href="/static/past_calls.css">
     <link rel="stylesheet" href="/static/modals.css">
-    <link rel="stylesheet" href="/static/header-additions.css">
 </head>
 <body>
     <!-- Action Buttons (Right Side) - populated by header.js -->
@@ -108,6 +111,7 @@
         </div>
     </div>
 
+    <script src="/static/utils.js"></script>
     <script src="/static/header.js"></script>
     <script src="/static/modal.js"></script>
     <script>
@@ -392,23 +396,8 @@
             return TRACK_LABELS[track] || track;
         }
 
-        function formatDate(isoDate) {
-            // Format like "Dec 6, 2024 · 3:42 PM" (date + time to disambiguate same-day interviews).
-            try {
-                var date = new Date(isoDate);
-                if (isNaN(date.getTime())) return isoDate;
-                var datePart = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-                var timePart = date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-                return datePart + ' · ' + timePart;
-            } catch (e) { return isoDate; }
-        }
-
-        function escapeHtml(text) {
-            if (text === null || typeof text === 'undefined') return '';
-            var div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
+        // formatDate and escapeHtml are provided globally by static/utils.js
+        // (loaded before this script).
 
         // ==================== CONTROL EVENT WIRING ====================
 
