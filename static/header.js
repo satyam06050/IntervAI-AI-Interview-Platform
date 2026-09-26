@@ -22,11 +22,11 @@
 
     applyStoredTheme();
 
-    var HeaderConfig = {
-        sponsorUrl: 'https://github.com/sponsors/PranavMishra17',
-        githubUrl: 'https://github.com/PranavMishra17/MockFlow-AI',
-        devImage: '/static/me.jpg'
-    };
+   var HeaderConfig = {
+    // sponsorUrl: 'https://github.com/sponsors/PranavMishra17',
+    githubUrl: 'https://github.com/satyam06050/IntervAI-AI-Interview-Platform',
+    devImage: '/static/me.jpg'
+};
 
     var Icons = {
         home: '<svg class="home-logo" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg"><circle cx="24" cy="24" r="20" fill="#C8E6C9"/><circle cx="24" cy="24" r="12" fill="#81C784"/><circle cx="24" cy="24" r="6" fill="#4CAF50"/></svg><svg class="home-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>',
@@ -319,17 +319,24 @@
                             '</div>' +
                             '<div class="section-title" style="margin-top:1.25rem"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>The developer</div>' +
                             '<div class="dev-profile">' +
-                                '<div class="dev-avatar"><img src="' + HeaderConfig.devImage + '" alt="Pranav Mishra"></div>' +
-                                '<div class="dev-info"><h3>Pranav Mishra</h3><p>AI/ML Engineer & Full-Stack Dev</p></div>' +
+                                '<div class="dev-avatar"><img src="' + HeaderConfig.devImage + '" alt="Satyam Kumar"></div>' +
+                                '<div class="dev-info"><h3>Satyam Kumar</h3><p>AI/ML Engineer & Full-Stack Dev</p></div>' +
                             '</div>' +
-                            '<div class="social-links">' +
-                                '<a href="https://portfolio-pranav-mishra-paranoid.vercel.app" target="_blank" class="social-link social-portfolio"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Portfolio</a>' +
-                                '<a href="https://www.linkedin.com/in/pranavgamedev/" target="_blank" class="social-link social-linkedin"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/></svg>LinkedIn</a>' +
-                                '<a href="https://portfolio-pranav-mishra-paranoid.vercel.app/resume" target="_blank" class="social-link social-resume"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>Resume</a>' +
-                                '<a href="https://www.youtube.com/@parano1dgames/featured" target="_blank" class="social-link social-youtube"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>YouTube</a>' +
-                                '<a href="https://huggingface.co/Paranoiid" target="_blank" class="social-link social-huggingface"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm6 13.5c-1.5 1.5-3.5 2.5-6 2.5s-4.5-1-6-2.5c0-2 4-3.5 6-3.5s6 1.5 6 3.5z"/></svg>HuggingFace</a>' +
-                                '<a href="https://scholar.google.com/citations?user=_Twn_owAAAAJ&hl=en&oi=sra" target="_blank" class="social-link social-scholar"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M5.242 13.769L0 9.5 12 0l12 9.5-5.242 4.269C17.548 11.249 14.978 9.5 12 9.5c-2.977 0-5.548 1.748-6.758 4.269zM12 10a7 7 0 1 0 0 14 7 7 0 0 0 0-14z"/></svg>Scholar</a>' +
-                            '</div>' +
+                           '<div class="social-links">' +
+
+    '<a href="https://krsatyam.in" target="_blank" class="social-link social-portfolio">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+            '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>' +
+            '<polyline points="15 3 21 3 21 9"/>' +
+            '<line x1="10" y1="14" x2="21" y2="3"/>' +
+        '</svg>Portfolio</a>' +
+
+    '<a href="https://www.linkedin.com/in/krsatyam0605" target="_blank" class="social-link social-linkedin">' +
+        '<svg viewBox="0 0 24 24" fill="currentColor">' +
+            '<path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.226.792 24 1.771 24h20.451C23.2 24 24 23.226 24 22.271V1.729C24 .774 23.2 0 22.225 0z"/>' +
+        '</svg>LinkedIn</a>' +
+
+'</div>' +
                         '</div>' +
                         '<div class="modal-footer">' +
                             '<button onclick="window.MockFlowHeader.closeDeveloperModal()" class="modal-btn">Close</button>' +
